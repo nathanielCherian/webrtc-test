@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Puffer WebRTC</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Puffer WebRTC</h1>
+  <div class="controls">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="download" disabled>Download JSON</button>
+    <details class="settings">
+      <summary>Settings</summary>
+      <label>Stats interval (ms) <input id="interval" type="number" value="250" min="50" step="50"></label>
+      <label>Jitter buffer target (ms, blank = browser default) <input id="jbTarget" type="number" min="0" step="10"></label>
+      <label>STUN URL (optional) <input id="stun" type="text" placeholder="stun:stun.l.google.com:19302"></label>
+      <label><input id="sendRaw" type="checkbox" checked> Send client stats to server log</label>
+    </details>
+  </div>
+  <div id="status" class="status">idle</div>
+</header>
+
+<main>
+  <section class="player">
+    <video id="video" playsinline controls muted></video>
+    <p class="hint">Starts muted so autoplay is allowed; unmute with the video controls.</p>
+    <div id="qoe" class="tiles"></div>
+  </section>
+
+  <section class="charts">
+    <figure><figcaption>Bitrate (kbps)</figcaption><canvas id="c-bitrate"></canvas></figure>
+    <figure><figcaption>Round-trip time (ms)</figcaption><canvas id="c-rtt"></canvas></figure>
+    <figure><figcaption>Frame rate (fps)</figcaption><canvas id="c-fps"></canvas></figure>
+    <figure><figcaption>Loss (%)</figcaption><canvas id="c-loss"></canvas></figure>
+    <figure><figcaption>Delay (ms)</figcaption><canvas id="c-delay"></canvas></figure>
+    <figure><figcaption>Quality</figcaption><canvas id="c-quality"></canvas></figure>
+  </section>
+
+  <section class="tables">
+    <details open><summary>Client: derived metrics (latest interval)</summary><div id="t-derived" class="kv"></div></details>
+    <details><summary>Client: inbound-rtp video (raw)</summary><pre id="t-vin"></pre></details>
+    <details><summary>Client: inbound-rtp audio (raw)</summary><pre id="t-ain"></pre></details>
+    <details><summary>Client: selected candidate pair / transport (raw)</summary><pre id="t-pair"></pre></details>
+    <details open><summary>Server: GCC / encoder / RTCP (latest)</summary><div id="t-server" class="kv"></div></details>
+    <details><summary>Server: full snapshot (raw)</summary><pre id="t-server-raw"></pre></details>
+    <details open><summary>Events</summary><ol id="events" class="events"></ol></details>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
