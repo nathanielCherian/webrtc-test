@@ -40,6 +40,11 @@ header {
   background: var(--panel);
 }
 h1 { font-size: 17px; margin: 0; }
+.modes { display: flex; gap: 2px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.modes a { padding: 4px 12px; color: var(--muted); text-decoration: none; }
+.modes a[aria-current="page"] { background: var(--accent); color: #fff; }
+#preview { display: none; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; }
+#preview.show { display: block; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 button {
   font: inherit;
@@ -59,7 +64,7 @@ button:disabled { opacity: .45; cursor: default; }
   margin-top: 6px;
   color: var(--muted);
 }
-.settings input[type=number], .settings input[type=text] {
+.settings input[type=number], .settings input[type=text], .settings select {
   display: block; width: 260px; margin-top: 2px; padding: 4px 6px;
   font: inherit; color: var(--text); background: var(--bg);
   border: 1px solid var(--border); border-radius: 4px;

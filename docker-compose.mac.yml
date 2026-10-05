@@ -1,0 +1,11 @@
+# macOS / Docker Desktop override: host networking only reaches Docker's Linux
+# VM, not the Mac, so publish the ports and advertise localhost in ICE.
+#   docker compose -f docker-compose.yml -f docker-compose.mac.yml up --build
+services:
+  puffer-webrtc:
+    network_mode: bridge
+    ports:
+      - "${PUFFER_HOST_HTTP_PORT:-8080}:8080/tcp"
+      - "50000:50000/udp"
+    environment:
+      PUFFER_PUBLIC_IP: "127.0.0.1"

@@ -3,5 +3,5 @@ package web
 
 import "embed"
 
-//go:embed index.html app.js style.css
+//go:embed index.html app.js style.css common.js uplink.html uplink.js
 var FS embed.FS

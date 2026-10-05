@@ -1,4 +1,4 @@
-.PHONY: build run standin docker clean
+.PHONY: build run standin docker docker-mac clean
 
 build:
 	CGO_ENABLED=1 go build -o bin/server ./cmd/server
@@ -13,6 +13,9 @@ run: build standin
 
 docker:
 	docker compose up --build
+
+docker-mac:
+	docker compose -f docker-compose.yml -f docker-compose.mac.yml up --build
 
 clean:
 	rm -rf bin

@@ -44,6 +44,7 @@ type Config struct {
 	ConnectTimeout                       time.Duration
 	MaxSessions                          int
 	ICEServers                           []webrtc.ICEServer
+	UplinkRecord                         bool // save received uplink streams next to the session log
 }
 
 // Manager creates and tracks sessions.
@@ -74,7 +75,11 @@ type OfferRequest struct {
 	SDP    string          `json:"sdp"`
 	Type   string          `json:"type"`
 	Client json.RawMessage `json:"client,omitempty"` // arbitrary client metadata, logged
+	Mode   string          `json:"mode,omitempty"`   // "" or "downlink": server sends; "uplink": browser sends
 }
+
+// ModeUplink is OfferRequest.Mode for sessions where the browser sends media.
+const ModeUplink = "uplink"
 
 // OfferResponse is returned from POST /offer.
 type OfferResponse struct {
@@ -83,9 +88,10 @@ type OfferResponse struct {
 	SessionID string `json:"sessionId"`
 }
 
-// Session is one viewer.
+// Session is one viewer (downlink) or one sender (uplink).
 type Session struct {
 	id      string
+	mode    string
 	mgr     *Manager
 	cfg     Config
 	info    *MediaInfo
@@ -111,6 +117,10 @@ type Session struct {
 	dc       atomic.Pointer[webrtc.DataChannel]
 	log      *telemetry.Logger
 
+	up          uplinkState
+	clockOffset atomic.Uint64 // float64 bits: server minus client wall clock (ms), NaN until the client reports one
+	clockRTT    atomic.Uint64 // float64 bits: RTT of the client's best clock ping (ms)
+
 	evMu   sync.Mutex
 	events []map[string]any // connection state timeline, also sent to client
 
@@ -133,14 +143,27 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	}
 	m.mu.Unlock()
 
-	s := &Session{id: newID(), mgr: m, cfg: m.cfg, info: m.info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
+	switch req.Mode {
+	case "", "downlink":
+		req.Mode = "downlink"
+	case ModeUplink:
+	default:
+		return nil, fmt.Errorf("unknown mode %q", req.Mode)
+	}
+	s := &Session{id: newID(), mode: req.Mode, mgr: m, cfg: m.cfg, info: m.info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
+	s.clockOffset.Store(math.Float64bits(math.NaN()))
+	s.clockRTT.Store(math.Float64bits(math.NaN()))
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	logName := s.id
+	if s.mode == ModeUplink {
+		logName += "_uplink"
+	}
 	var err error
-	if s.log, err = telemetry.NewLogger(m.cfg.LogDir, s.id); err != nil {
+	if s.log, err = telemetry.NewLogger(m.cfg.LogDir, logName); err != nil {
 		return nil, fmt.Errorf("create log: %w", err)
 	}
 	s.log.Log("meta", "session", map[string]any{
-		"sessionId": s.id, "remoteAddr": remoteAddr, "client": req.Client,
+		"sessionId": s.id, "mode": s.mode, "remoteAddr": remoteAddr, "client": req.Client,
 		"media": m.info, "config": m.cfg, "host": m.host,
 	})
 
@@ -165,33 +188,21 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 
 	ld := s.pc.LocalDescription()
 	s.log.Log("meta", "answer", map[string]any{"offer": req.SDP, "answer": ld.SDP})
-	log.Printf("[%s] new session from %s (log: %s)", s.id, remoteAddr, s.log.Path)
+	log.Printf("[%s] new %s session from %s (log: %s)", s.id, s.mode, remoteAddr, s.log.Path)
 	return &OfferResponse{SDP: ld.SDP, Type: ld.Type.String(), SessionID: s.id}, nil
 }
 
 func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 	me := &webrtc.MediaEngine{}
-	if err := registerCodecs(me); err != nil {
-		return err
-	}
 	ir := &interceptor.Registry{}
-
-	// Order matters: later interceptors wrap earlier ones on the send path, so
-	// packets flow NACK buffer -> stats -> TWCC seq numbering -> GCC pacer -> wire.
-	bweCh := make(chan cc.BandwidthEstimator, 1)
-	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
-		return gcc.NewSendSideBWE(
-			gcc.SendSideBWEInitialBitrate(s.cfg.StartBitrate),
-			gcc.SendSideBWEMinBitrate(s.cfg.MinBitrate),
-			gcc.SendSideBWEMaxBitrate(s.cfg.MaxBitrate),
-		)
-	})
-	if err != nil {
-		return err
+	var bweCh chan cc.BandwidthEstimator
+	var err error
+	if s.mode == ModeUplink {
+		err = configureUplink(me, ir)
+	} else {
+		bweCh, err = s.configureDownlink(me, ir)
 	}
-	ccFactory.OnNewPeerConnection(func(_ string, e cc.BandwidthEstimator) { bweCh <- e })
-	ir.Add(ccFactory)
-	if err := webrtc.ConfigureTWCCHeaderExtensionSender(me, ir); err != nil {
+	if err != nil {
 		return err
 	}
 	getterCh := make(chan stats.Getter, 1)
@@ -216,42 +227,27 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 		return err
 	}
 	s.pc = pc
-	s.bwe = <-bweCh
 	s.statsGetter = <-getterCh
-
-	s.videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
-		MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: h264Fmtp,
-	}, "video", "puffer")
+	if s.mode == ModeUplink {
+		err = s.addUplinkTransceivers()
+	} else {
+		s.bwe = <-bweCh
+		err = s.addDownlinkTracks()
+	}
 	if err != nil {
 		return err
 	}
-	s.audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
-		MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
-	}, "audio", "puffer")
-	if err != nil {
-		return err
-	}
-	videoSender, err := pc.AddTrack(s.videoTrack)
-	if err != nil {
-		return err
-	}
-	audioSender, err := pc.AddTrack(s.audioTrack)
-	if err != nil {
-		return err
-	}
-	s.videoSSRC = uint32(videoSender.GetParameters().Encodings[0].SSRC)
-	s.audioSSRC = uint32(audioSender.GetParameters().Encodings[0].SSRC)
-	s.rtcpVideo = telemetry.NewRTCPCounters(s.videoSSRC)
-	s.rtcpAudio = telemetry.NewRTCPCounters(s.audioSSRC)
-	go s.readRTCP(videoSender, s.rtcpVideo, true)
-	go s.readRTCP(audioSender, s.rtcpAudio, false)
 
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		s.event("pcState", st.String())
 		switch st {
 		case webrtc.PeerConnectionStateConnected:
 			if s.started.CompareAndSwap(false, true) {
-				go s.run()
+				if s.mode == ModeUplink {
+					go s.runUplink()
+				} else {
+					go s.run()
+				}
 			}
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			s.Close("peer connection " + st.String())
@@ -269,7 +265,7 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 			s.event("dataChannel", "open")
 			s.send(map[string]any{
 				"type": "server-hello", "sessionId": s.id, "serverTimeMs": telemetry.NowMs(),
-				"media": s.info, "config": s.cfg, "host": s.mgr.host,
+				"mode": s.mode, "media": s.info, "config": s.cfg, "host": s.mgr.host,
 				"videoSsrc": s.videoSSRC, "audioSsrc": s.audioSSRC, "logFile": s.log.Path,
 			})
 		})
@@ -295,6 +291,66 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 	case <-time.After(10 * time.Second):
 		return errors.New("ICE gathering timed out")
 	}
+	return nil
+}
+
+// configureDownlink registers the send-side codecs and GCC. It returns the
+// channel that receives the session's bandwidth estimator.
+func (s *Session) configureDownlink(me *webrtc.MediaEngine, ir *interceptor.Registry) (chan cc.BandwidthEstimator, error) {
+	if err := registerCodecs(me); err != nil {
+		return nil, err
+	}
+	// Order matters: later interceptors wrap earlier ones on the send path, so
+	// packets flow NACK buffer -> stats -> TWCC seq numbering -> GCC pacer -> wire.
+	bweCh := make(chan cc.BandwidthEstimator, 1)
+	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+		return gcc.NewSendSideBWE(
+			gcc.SendSideBWEInitialBitrate(s.cfg.StartBitrate),
+			gcc.SendSideBWEMinBitrate(s.cfg.MinBitrate),
+			gcc.SendSideBWEMaxBitrate(s.cfg.MaxBitrate),
+		)
+	})
+	if err != nil {
+		return nil, err
+	}
+	ccFactory.OnNewPeerConnection(func(_ string, e cc.BandwidthEstimator) { bweCh <- e })
+	ir.Add(ccFactory)
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(me, ir); err != nil {
+		return nil, err
+	}
+	return bweCh, nil
+}
+
+// addDownlinkTracks adds the H264 and Opus tracks the server sends.
+func (s *Session) addDownlinkTracks() error {
+	var err error
+	s.videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: h264Fmtp,
+	}, "video", "puffer")
+	if err != nil {
+		return err
+	}
+	s.audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
+	}, "audio", "puffer")
+	if err != nil {
+		return err
+	}
+	videoSender, err := s.pc.AddTrack(s.videoTrack)
+	if err != nil {
+		return err
+	}
+	audioSender, err := s.pc.AddTrack(s.audioTrack)
+	if err != nil {
+		return err
+	}
+	s.videoSSRC = uint32(videoSender.GetParameters().Encodings[0].SSRC)
+	s.audioSSRC = uint32(audioSender.GetParameters().Encodings[0].SSRC)
+	s.rtcpVideo = telemetry.NewRTCPCounters(s.videoSSRC)
+	s.rtcpAudio = telemetry.NewRTCPCounters(s.audioSSRC)
+	go s.readRTCP(videoSender, s.rtcpVideo, true)
+	go s.readRTCP(audioSender, s.rtcpAudio, false)
+
 	return nil
 }
 
@@ -508,36 +564,22 @@ func (s *Session) telemetryLoop() {
 
 // snapshot gathers everything the server knows about this session.
 func (s *Session) snapshot(full bool) map[string]any {
-	gccStats := map[string]any{"targetBitrate": s.bwe.GetTargetBitrate()}
-	for k, v := range s.bwe.GetStats() {
-		gccStats[k] = v
-	}
-	enc := s.encStats.Window()
-	enc["width"], enc["height"], enc["fps"] = s.info.Width, s.info.Height, s.info.FPS
-	mediaInfo := map[string]any{}
-	if p := s.pipe.Load(); p != nil {
-		pos, loops := p.MediaPosition()
-		mediaInfo = map[string]any{"positionSec": pos, "loops": loops,
-			"framesRead": p.FramesRead.Load(), "audioPages": p.AudioPages.Load()}
-	}
 	snap := map[string]any{
 		"type":         "server-stats",
 		"sessionId":    s.id,
+		"mode":         s.mode,
 		"serverTimeMs": telemetry.NowMs(),
 		"uptimeSec":    time.Since(s.created).Seconds(),
-		"gcc":          gccStats,
-		"encoder":      enc,
-		"media":        mediaInfo,
-		"rtcp":         map[string]any{"video": s.rtcpVideo.Snapshot(), "audio": s.rtcpAudio.Snapshot()},
-		"interceptorStats": map[string]any{
-			"video": s.interceptorStats(s.videoSSRC),
-			"audio": s.interceptorStats(s.audioSSRC),
-		},
 		"state": map[string]any{
 			"pc":        s.pc.ConnectionState().String(),
 			"ice":       s.pc.ICEConnectionState().String(),
 			"signaling": s.pc.SignalingState().String(),
 		},
+	}
+	if s.mode == ModeUplink {
+		snap["uplink"] = s.uplinkSnapshot()
+	} else {
+		s.downlinkSnapshot(snap)
 	}
 	if sctp := s.pc.SCTP(); sctp != nil && sctp.Transport() != nil && sctp.Transport().ICETransport() != nil {
 		if pair, err := sctp.Transport().ICETransport().GetSelectedCandidatePair(); err == nil && pair != nil {
@@ -555,6 +597,30 @@ func (s *Session) snapshot(full bool) map[string]any {
 		s.evMu.Unlock()
 	}
 	return snap
+}
+
+// downlinkSnapshot adds the GCC, encoder and sender-side RTCP sections.
+func (s *Session) downlinkSnapshot(snap map[string]any) {
+	gccStats := map[string]any{"targetBitrate": s.bwe.GetTargetBitrate()}
+	for k, v := range s.bwe.GetStats() {
+		gccStats[k] = v
+	}
+	enc := s.encStats.Window()
+	enc["width"], enc["height"], enc["fps"] = s.info.Width, s.info.Height, s.info.FPS
+	mediaInfo := map[string]any{}
+	if p := s.pipe.Load(); p != nil {
+		pos, loops := p.MediaPosition()
+		mediaInfo = map[string]any{"positionSec": pos, "loops": loops,
+			"framesRead": p.FramesRead.Load(), "audioPages": p.AudioPages.Load()}
+	}
+	snap["gcc"] = gccStats
+	snap["encoder"] = enc
+	snap["media"] = mediaInfo
+	snap["rtcp"] = map[string]any{"video": s.rtcpVideo.Snapshot(), "audio": s.rtcpAudio.Snapshot()}
+	snap["interceptorStats"] = map[string]any{
+		"video": s.interceptorStats(s.videoSSRC),
+		"audio": s.interceptorStats(s.audioSSRC),
+	}
 }
 
 // interceptorStats splits pion's stats.Stats into its parts: the embedded
@@ -577,11 +643,26 @@ func (s *Session) interceptorStats(ssrc uint32) map[string]any {
 
 func (s *Session) onClientMessage(data []byte) {
 	var head struct {
-		Type string `json:"type"`
+		Type     string   `json:"type"`
+		ID       int64    `json:"id"`
+		T1       float64  `json:"t1"`
+		OffsetMs *float64 `json:"offsetMs"`
+		RTTMs    *float64 `json:"rttMs"`
 	}
 	_ = json.Unmarshal(data, &head)
-	if head.Type == "" {
+	switch head.Type {
+	case "":
 		head.Type = "unknown"
+	case "clock-ping":
+		// Answered immediately and not logged; the client reports its
+		// resulting estimate with "clock-sync".
+		s.send(map[string]any{"type": "clock-pong", "id": head.ID, "t1": head.T1, "t2": telemetry.NowMs()})
+		return
+	case "clock-sync":
+		if head.OffsetMs != nil && head.RTTMs != nil {
+			s.clockRTT.Store(math.Float64bits(*head.RTTMs))
+			s.clockOffset.Store(math.Float64bits(*head.OffsetMs))
+		}
 	}
 	s.log.Log("client", head.Type, json.RawMessage(data))
 }
@@ -625,6 +706,7 @@ func (s *Session) Close(reason string) {
 		if s.pc != nil {
 			_ = s.pc.Close()
 		}
+		s.up.closeRecorders()
 		_ = s.log.Close()
 		s.mgr.mu.Lock()
 		delete(s.mgr.sessions, s.id)

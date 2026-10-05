@@ -54,6 +54,7 @@ func main() {
 		fullEvery    = flag.Int("full-stats-every", 4, "include full pc.GetStats() every N telemetry ticks (0 = never)")
 		logDir       = flag.String("log-dir", "logs", "directory for per-session JSONL logs")
 		maxSessions  = flag.Int("max-sessions", 8, "maximum concurrent viewers (each costs ~1 CPU core at 720p30)")
+		uplinkRecord = flag.Bool("uplink-record", false, "save received uplink media (.h264/.ivf/.ogg) next to each session log")
 	)
 	flag.VisitAll(func(f *flag.Flag) {
 		if v, ok := os.LookupEnv(envName(f.Name)); ok {
@@ -111,7 +112,7 @@ func main() {
 		AudioBitrate: *audioBitrate, Headroom: *headroom, KeyIntSec: *keyintSec,
 		X264Preset: *preset, X264Threads: *threads,
 		TelemetryInterval: *telemetryInt, FullStatsEvery: *fullEvery,
-		LogDir: *logDir, ConnectTimeout: 30 * time.Second, MaxSessions: *maxSessions,
+		LogDir: *logDir, ConnectTimeout: 30 * time.Second, MaxSessions: *maxSessions, UplinkRecord: *uplinkRecord,
 		ICEServers: iceServers,
 	}
 	mgr := session.NewManager(cfg, info, se, hostInfo(*publicIP, *udpPort))
