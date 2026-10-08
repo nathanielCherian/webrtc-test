@@ -25,6 +25,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"puffer-webrtc/internal/session"
+	"puffer-webrtc/internal/simulcast"
 	"puffer-webrtc/internal/x264"
 	"puffer-webrtc/web"
 )
@@ -36,30 +37,33 @@ func envName(flagName string) string {
 
 func main() {
 	var (
-		httpAddr     = flag.String("http-addr", ":8080", "HTTP(S) listen address")
-		tlsCert      = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
-		tlsKey       = flag.String("tls-key", "", "TLS key file")
-		videoPath    = flag.String("video", "media/standin.mp4", "default source video file (looped)")
-		mediaDir     = flag.String("media-dir", "", "directory of videos the page can choose from and upload to (default: the --video file's directory)")
-		allowUpload  = flag.Bool("allow-upload", true, "allow uploading videos to --media-dir from the page")
-		maxUploadMB  = flag.Int64("max-upload-mb", 2048, "largest accepted upload (MB)")
-		publicIP     = flag.String("public-ip", "", "public IP(s) to advertise in ICE host candidates, comma-separated (for cloud VMs behind 1:1 NAT)")
-		udpPort      = flag.Int("udp-port", 50000, "single UDP port for all WebRTC media (0 = ephemeral ports)")
-		stunURLs     = flag.String("stun", "", "STUN server URL(s), comma-separated, e.g. stun:stun.l.google.com:19302")
-		ipv6         = flag.Bool("ipv6", false, "also gather IPv6 candidates")
-		startBitrate = flag.Int("start-bitrate", 1_000_000, "GCC initial bitrate (bps)")
-		minBitrate   = flag.Int("min-bitrate", 100_000, "GCC minimum bitrate (bps)")
-		maxBitrate   = flag.Int("max-bitrate", 6_000_000, "GCC maximum bitrate (bps)")
-		audioBitrate = flag.Int("audio-bitrate", 64_000, "Opus bitrate (bps)")
-		headroom     = flag.Float64("headroom", 0.9, "fraction of the GCC target given to audio+video payload (rest is RTP/FEC overhead)")
-		keyintSec    = flag.Float64("keyint", 0, "seconds between periodic IDRs (0 = only on PLI/FIR, like real-time WebRTC)")
-		preset       = flag.String("x264-preset", "veryfast", "x264 preset")
-		threads      = flag.Int("x264-threads", 0, "x264 threads (0 = auto)")
-		telemetryInt = flag.Duration("telemetry-interval", 250*time.Millisecond, "server telemetry period")
-		fullEvery    = flag.Int("full-stats-every", 4, "include full pc.GetStats() every N telemetry ticks (0 = never)")
-		logDir       = flag.String("log-dir", "logs", "directory for per-session JSONL logs")
-		maxSessions  = flag.Int("max-sessions", 8, "maximum concurrent viewers (each costs ~1 CPU core at 720p30)")
-		uplinkRecord = flag.Bool("uplink-record", false, "save received uplink media (.h264/.ivf/.ogg) next to each session log")
+		httpAddr      = flag.String("http-addr", ":8080", "HTTP(S) listen address")
+		tlsCert       = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
+		tlsKey        = flag.String("tls-key", "", "TLS key file")
+		videoPath     = flag.String("video", "media/standin.mp4", "default source video file (looped)")
+		mediaDir      = flag.String("media-dir", "", "directory of videos the page can choose from and upload to (default: the --video file's directory)")
+		allowUpload   = flag.Bool("allow-upload", true, "allow uploading videos to --media-dir from the page")
+		maxUploadMB   = flag.Int64("max-upload-mb", 2048, "largest accepted upload (MB)")
+		publicIP      = flag.String("public-ip", "", "public IP(s) to advertise in ICE host candidates, comma-separated (for cloud VMs behind 1:1 NAT)")
+		udpPort       = flag.Int("udp-port", 50000, "single UDP port for all WebRTC media (0 = ephemeral ports)")
+		stunURLs      = flag.String("stun", "", "STUN server URL(s), comma-separated, e.g. stun:stun.l.google.com:19302")
+		ipv6          = flag.Bool("ipv6", false, "also gather IPv6 candidates")
+		startBitrate  = flag.Int("start-bitrate", 1_000_000, "GCC initial bitrate (bps)")
+		minBitrate    = flag.Int("min-bitrate", 100_000, "GCC minimum bitrate (bps)")
+		maxBitrate    = flag.Int("max-bitrate", 6_000_000, "GCC maximum bitrate (bps)")
+		audioBitrate  = flag.Int("audio-bitrate", 64_000, "Opus bitrate (bps)")
+		headroom      = flag.Float64("headroom", 0.9, "fraction of the GCC target given to audio+video payload (rest is RTP/FEC overhead)")
+		keyintSec     = flag.Float64("keyint", 0, "seconds between periodic IDRs (0 = only on PLI/FIR, like real-time WebRTC)")
+		preset        = flag.String("x264-preset", "veryfast", "x264 preset")
+		threads       = flag.Int("x264-threads", 0, "x264 threads (0 = auto)")
+		telemetryInt  = flag.Duration("telemetry-interval", 250*time.Millisecond, "server telemetry period")
+		fullEvery     = flag.Int("full-stats-every", 4, "include full pc.GetStats() every N telemetry ticks (0 = never)")
+		logDir        = flag.String("log-dir", "logs", "directory for per-session JSONL logs")
+		maxSessions   = flag.Int("max-sessions", 8, "maximum concurrent viewers (each costs ~1 CPU core at 720p30)")
+		uplinkRecord  = flag.Bool("uplink-record", false, "save received uplink media (.h264/.ivf/.ogg) next to each session log")
+		simulcastSpec = flag.String("simulcast", "", "shared pre-encoded renditions to offer as the \"simulcast\" source: "+
+			"name=host:port@bitrate,... (MPEG-TS over UDP, e.g. high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k)")
+		simulcastAudio = flag.String("simulcast-audio", "", "rendition whose AAC audio is transcoded (once) to Opus for simulcast sessions; default the highest, \"none\" for no audio")
 	)
 	flag.VisitAll(func(f *flag.Flag) {
 		if v, ok := os.LookupEnv(envName(f.Name)); ok {
@@ -126,6 +130,45 @@ func main() {
 	lib := session.NewLibrary(*mediaDir, info, *allowUpload, *maxUploadMB<<20)
 	log.Printf("video library %s (uploads %s)", *mediaDir, map[bool]string{true: "allowed", false: "disabled"}[*allowUpload])
 	mgr := session.NewManager(cfg, lib, se, hostInfo(*publicIP, *udpPort))
+	var hub *simulcast.Hub
+	if *simulcastSpec != "" {
+		layers, err := simulcast.ParseLayers(*simulcastSpec)
+		if err != nil {
+			log.Fatalf("--simulcast: %v", err)
+		}
+		audioLayer := 0
+		switch *simulcastAudio {
+		case "":
+		case "none":
+			audioLayer = -1
+		default:
+			audioLayer = -1
+			for i, l := range layers {
+				if l.Name == *simulcastAudio {
+					audioLayer = i
+				}
+			}
+			if audioLayer < 0 {
+				log.Fatalf("--simulcast-audio: no layer named %q", *simulcastAudio)
+			}
+		}
+		hub = simulcast.NewHub(layers, simulcast.Options{AudioLayer: audioLayer, AudioBitrate: *audioBitrate})
+		go func() {
+			if err := hub.Run(ctx); err != nil {
+				log.Fatalf("simulcast: %v", err)
+			}
+		}()
+		mgr.SetSimulcast(hub)
+		for _, l := range layers {
+			log.Printf("simulcast layer %s: %d kbps from udp %s", l.Name, l.BitrateBps/1000, l.Addr)
+		}
+	}
+	simulcastStatus := func() any {
+		if hub == nil {
+			return nil
+		}
+		return hub.Snapshot()
+	}
 
 	mux := http.NewServeMux()
 	static, _ := fs.Sub(web.FS, ".")
@@ -134,10 +177,11 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sessions": mgr.ActiveSessions()})
 	})
 	mux.HandleFunc("GET /info", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"media": info, "config": cfg, "sessions": mgr.ActiveSessions()})
+		writeJSON(w, http.StatusOK, map[string]any{"media": info, "config": cfg, "sessions": mgr.ActiveSessions(), "simulcast": simulcastStatus()})
 	})
 	mux.HandleFunc("GET /videos", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"videos": lib.List(r.Context()), "allowUpload": lib.AllowUpload, "maxUploadMB": *maxUploadMB})
+		writeJSON(w, http.StatusOK, map[string]any{"videos": lib.List(r.Context()), "allowUpload": lib.AllowUpload, "maxUploadMB": *maxUploadMB,
+			"simulcast": simulcastStatus()})
 	})
 	// The body is the raw file (no multipart), so large uploads stream to disk.
 	mux.HandleFunc("POST /videos", func(w http.ResponseWriter, r *http.Request) {

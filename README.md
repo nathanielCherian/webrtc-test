@@ -13,6 +13,7 @@ RTCP PLI/FIR ─► force IDR     server telemetry ◄── DataChannel "teleme
 - **Codecs:** H.264 constrained-baseline video, no B-frames, and IDR frames only on PLI/FIR by default (`--keyint` changes this). Audio is Opus, 20 ms frames, 64 kbps.
 - **Signaling:** a single `POST /offer` without trickle ICE. Media uses one UDP port (default 50000).
 - **Rate control:** GCC by default. The page's Settings can switch a session to an open-loop sine or square wave instead. See [Rate control](#rate-control).
+- **Shared simulcast source:** with `--simulcast`, viewers can instead receive pre-encoded renditions (for example from the [sfu-test](#shared-simulcast-source) transcoder). Each viewer keeps its own PeerConnection and rate control, but nothing is encoded per viewer: the rate control picks which rendition to forward. See [Shared simulcast source](#shared-simulcast-source).
 - **Uplink test:** `/uplink.html` reverses the direction. The browser sends a generated video and a tone, and the server receives and measures them. See [Uplink test](#uplink-test).
 
 ## Running on a server (Docker)
@@ -60,6 +61,8 @@ Every flag can also be set as an environment variable: `--foo-bar` becomes `PUFF
 | `--log-dir` | `logs` | per-session JSONL logs |
 | `--max-sessions` | 8 | shared by downlink and uplink sessions |
 | `--uplink-record` | false | save received uplink media (`.h264`/`.ivf`/`.ogg`) next to each session log |
+| `--simulcast` | | renditions for the shared simulcast source: `name=host:port@bitrate,...` (MPEG-TS over UDP), e.g. `high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k` |
+| `--simulcast-audio` | highest layer | rendition whose AAC audio is transcoded (once) to Opus; `none` for no audio |
 
 ## What gets measured
 
@@ -188,6 +191,69 @@ browser GCC ◄── TWCC feedback, RR, NACK, PLI ◄────────�
   - `delayVarMs*` is `d − min(d)`. It needs no clock assumptions and shows queueing build-up directly.
   - Audio delays are measured the same way and include the 20 ms Opus frame duration.
 - **Logs:** `logs/<UTC time>_<session>_uplink.jsonl`, in the same record format as the downlink. Server snapshots have an `uplink` section instead of `gcc`/`encoder`. Client `client-stats` carry the outbound stats and the per-frame source log (frame number and generation time). `--uplink-record` writes the received media next to the log; under loss the recording may contain broken frames, since packets are written in arrival order.
+
+## Shared simulcast source
+
+The default source encodes the video once per viewer. The simulcast source encodes it once for everyone: an external encoder produces a few constant-bitrate H.264 renditions, the server ingests them, and every viewer forwards one of them.
+
+```
+                    MPEG-TS/UDP                  ┌─ viewer A: PeerConnection + GCC ──► forwards high ─► browser
+transcoder ─┬─ high 2500k :5001 ─┐               │
+(sfu-test)  ├─ mid   800k :5002 ─┼─► hub ────────┼─ viewer B: PeerConnection + GCC ──► forwards mid ──► browser
+            └─ low   250k :5003 ─┘ (demux once,  │
+                                   AAC→Opus once)└─ viewer C: PeerConnection + square wave ─► low/mid ─► browser
+```
+
+- **Hub (`internal/simulcast`):** listens on each rendition's UDP port, demultiplexes the MPEG-TS, and reads each layer's resolution from its SPS. It shares every access unit with all viewers without copying. The AAC audio of one rendition goes through a single shared ffmpeg to become Opus.
+- **Per viewer (`internal/session/simulcast.go`):** the viewer's own bandwidth estimator gives a video budget (`headroom × target − audio`, as before). The forwarded layer is the highest one whose nominal bitrate fits:
+  - **Down:** switches as soon as the current layer no longer fits.
+  - **Up:** switches once the budget has covered 1.1× the higher layer for 1 s.
+  - **When:** a switch happens at the target layer's next IDR. This relies on the renditions having IDRs at the same timestamps (the sfu-test transcoder guarantees this). All layers share one 90 kHz clock, so the RTP timestamps stay continuous across a switch.
+  - **Packetisation:** each viewer packetises the frames itself on a `TrackLocalStaticRTP`, so the sequence numbers and timestamps are its own.
+- **Probing:** Pion's GCC never raises its estimate above 1.5× the rate it sees acknowledged, so a viewer sending a fixed-rate low layer would never discover that a higher layer fits. As libwebrtc does, a GCC viewer below the top layer pads its send rate up to its estimate (at most what the next layer needs). The padding is sent as RTP padding-only packets, which browsers discard. Pion's GCC only counts payload bytes, so probes go through GCC as zero-filled payloads and become padding just before SRTP (`ratecontrol.PaddingProbes`). Padding pauses for 3 s after GCC lowers its target. Wave modes never pad, because their target is open-loop.
+- **Keyframes:** the encoder is shared, so a viewer's PLI/FIR can't force an IDR. The viewer instead stops sending until the next periodic IDR of its layer, and the event is counted as `keyframeWaits`. The GOP length of the renditions therefore bounds three things: startup time, how quickly a down-switch takes effect, and recovery after a PLI. With 2 s GOPs, a down-switch can keep sending the old layer for up to 2 s.
+
+### Running it
+
+```sh
+# 1. sfu-test: mock live feed + transcoder (sends the renditions to UDP 5001-5003)
+~/sfu-test/source/serve_source.sh &
+(cd ~/sfu-test && .venv/bin/python -m transcoder) &
+
+# 2. this server, with the renditions as the simulcast source
+./bin/server --simulcast high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k
+```
+
+On the page, **Settings → Video** lists "Live simulcast (shared encoder)" first and selects it by default. The bitrate chart then shows:
+- the forwarded layer's nominal bitrate (under "encoder configured / simulcast layer"),
+- the probe padding,
+- the client's received rate.
+
+Layer switches appear in **Events**. The server table has a `simulcast` section with:
+- the current layer, any pending switch and the budget,
+- the switch count, keyframe waits and padding,
+- frames sent per layer.
+
+The `media` section shows the hub's per-layer status: measured bitrate, resolution, fps, keyframes and TS continuity errors.
+
+The API is `"source": "simulcast"` in the `/offer` body. `GET /info` and `GET /videos` include the hub status under `simulcast`.
+
+The UDP ports are bound by this server. Anything else that reads them, such as sfu-test's `tools/relay.sh`, must use different ports. The renditions are 720p60 at level 3.2, while the SDP signals level 3.1 (`42e01f`). Browsers decode them anyway; strict decoders may not.
+
+### Headless test client
+
+`cmd/simclient` is a receive-only Pion viewer for testing without a browser. It negotiates like the page, sends real TWCC/RTCP feedback, and prints:
+- the server's target, layer and padding for each viewer,
+- what each viewer received.
+
+It can also record viewer 0's H.264.
+
+```sh
+go build -o bin/simclient ./cmd/simclient
+./bin/simclient -n 3 -duration 60s                                     # 3 GCC viewers
+./bin/simclient -rc square -center 1500 -amp 1200 -period 16           # force layer switches
+./bin/simclient -record c0.h264 && ffprobe -show_frames c0.h264        # check the forwarded stream decodes
+```
 
 ## Notes and caveats for experiments
 - **Telemetry uses the same path as the media.** It goes over SCTP, which GCC does not account for. Server to client is about 10 KB/s at the defaults. Client to server (upstream) is larger. To reduce it, raise `--telemetry-interval` or `--full-stats-every`, or untick "Send client stats" in the page settings.

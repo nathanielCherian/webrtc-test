@@ -1,5 +1,6 @@
 // Package session owns one viewer: its PeerConnection, the ffmpeg decode
-// pipeline, the x264 encoder driven by GCC, and the telemetry stream.
+// pipeline, the x264 encoder driven by GCC (or, for simulcast sessions, the
+// choice of which shared rendition to forward), and the telemetry stream.
 package session
 
 import (
@@ -24,6 +25,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"puffer-webrtc/internal/ratecontrol"
+	"puffer-webrtc/internal/simulcast"
 	"puffer-webrtc/internal/telemetry"
 	"puffer-webrtc/internal/x264"
 )
@@ -58,6 +60,7 @@ type Manager struct {
 	lib      *Library
 	settings webrtc.SettingEngine
 	host     map[string]any
+	hub      *simulcast.Hub // nil unless --simulcast
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -84,6 +87,9 @@ type OfferRequest struct {
 	Mode   string          `json:"mode,omitempty"`   // "" or "downlink": server sends; "uplink": browser sends
 	// Video is a file name from the media library; "" means the --video default.
 	Video string `json:"video,omitempty"`
+	// Source is "" (or "file"): decode and encode Video for this session alone; or
+	// "simulcast": forward the shared pre-encoded renditions (Video is ignored).
+	Source string `json:"source,omitempty"`
 	// RateControl picks the downlink bandwidth estimator; nil means GCC.
 	RateControl *RateControlRequest `json:"rateControl,omitempty"`
 }
@@ -137,6 +143,9 @@ type Session struct {
 	rtcpVideo   *telemetry.RTCPCounters
 	rtcpAudio   *telemetry.RTCPCounters
 
+	sim      *simState                   // set for simulcast sessions
+	videoRTP *webrtc.TrackLocalStaticRTP // simulcast video (packetized by the session)
+
 	enc      *x264.Encoder
 	encStats *telemetry.EncoderStats
 	pipe     atomic.Pointer[Pipeline]
@@ -183,12 +192,22 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 		return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
 	}
 	info := m.info
-	if req.Mode != ModeUplink {
+	var sim *simState
+	switch {
+	case req.Mode == ModeUplink:
+	case req.Source == SourceSimulcast:
+		if info, err = m.simulcastInfo(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
+		}
+		sim = newSimState(m.hub)
+	case req.Source == "" || req.Source == "file":
 		if info, err = m.lib.Get(ctx, req.Video); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
 		}
+	default:
+		return nil, fmt.Errorf("%w: unknown source %q", ErrBadOffer, req.Source)
 	}
-	s := &Session{id: newID(), mode: req.Mode, rc: rc, wave: wave, mgr: m, cfg: m.cfg, info: info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
+	s := &Session{id: newID(), mode: req.Mode, rc: rc, wave: wave, mgr: m, cfg: m.cfg, info: info, sim: sim, created: time.Now(), encStats: telemetry.NewEncoderStats()}
 	s.clockOffset.Store(math.Float64bits(math.NaN()))
 	s.clockRTT.Store(math.Float64bits(math.NaN()))
 	s.ctx, s.cancel = context.WithCancel(context.Background())
@@ -202,6 +221,7 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	s.log.Log("meta", "session", map[string]any{
 		"sessionId": s.id, "mode": s.mode, "remoteAddr": remoteAddr, "client": req.Client,
 		"media": s.info, "config": m.cfg, "host": m.host, "rateControl": s.rateControlInfo(),
+		"simulcast": s.simulcastLayers(),
 	})
 
 	if err := s.setup(ctx, req); err != nil {
@@ -329,9 +349,12 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 		switch st {
 		case webrtc.PeerConnectionStateConnected:
 			if s.started.CompareAndSwap(false, true) {
-				if s.mode == ModeUplink {
+				switch {
+				case s.mode == ModeUplink:
 					go s.runUplink()
-				} else {
+				case s.sim != nil:
+					go s.runSimulcast()
+				default:
 					go s.run()
 				}
 			}
@@ -353,6 +376,7 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 				"type": "server-hello", "sessionId": s.id, "serverTimeMs": telemetry.NowMs(),
 				"mode": s.mode, "media": s.info, "config": s.cfg, "host": s.mgr.host,
 				"rateControl": s.rateControlInfo(), "videoSsrc": s.videoSSRC, "audioSsrc": s.audioSSRC, "logFile": s.log.Path,
+				"simulcast": s.simulcastLayers(),
 			})
 		})
 		dc.OnClose(func() { s.event("dataChannel", "closed") })
@@ -392,13 +416,17 @@ func (s *Session) configureDownlink(me *webrtc.MediaEngine, ir *interceptor.Regi
 	bweCh := make(chan cc.BandwidthEstimator, 1)
 	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 		if s.wave != nil {
-			return ratecontrol.NewWave(*s.wave), nil
+			return s.wrapEstimator(ratecontrol.NewWave(*s.wave)), nil
 		}
-		return gcc.NewSendSideBWE(
+		est, err := gcc.NewSendSideBWE(
 			gcc.SendSideBWEInitialBitrate(s.cfg.StartBitrate),
 			gcc.SendSideBWEMinBitrate(s.cfg.MinBitrate),
 			gcc.SendSideBWEMaxBitrate(s.cfg.MaxBitrate),
 		)
+		if err != nil {
+			return nil, err
+		}
+		return s.wrapEstimator(est), nil
 	})
 	if err != nil {
 		return nil, err
@@ -414,19 +442,23 @@ func (s *Session) configureDownlink(me *webrtc.MediaEngine, ir *interceptor.Regi
 // addDownlinkTracks adds the H264 and Opus tracks the server sends.
 func (s *Session) addDownlinkTracks() error {
 	var err error
-	s.videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
-		MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: h264Fmtp,
-	}, "video", "puffer")
-	if err != nil {
-		return err
-	}
 	s.audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
 	}, "audio", "puffer")
 	if err != nil {
 		return err
 	}
-	videoSender, err := s.pc.AddTrack(s.videoTrack)
+	var videoSender *webrtc.RTPSender
+	if s.sim != nil {
+		videoSender, err = s.addSimulcastVideoTrack()
+	} else {
+		s.videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+			MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: h264Fmtp,
+		}, "video", "puffer")
+		if err == nil {
+			videoSender, err = s.pc.AddTrack(s.videoTrack)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -487,7 +519,7 @@ func (s *Session) run() {
 	if s.cfg.KeyIntSec > 0 {
 		keyint = int(math.Round(s.cfg.KeyIntSec * s.info.FPS))
 	}
-	if wave, ok := s.bwe.(*ratecontrol.Wave); ok {
+	if wave, ok := s.waveEstimator(); ok {
 		wave.Start()
 	}
 	initial := s.videoBitrateFor(s.bwe.GetTargetBitrate())
@@ -711,7 +743,18 @@ func (s *Session) downlinkSnapshot(snap map[string]any) {
 	enc := s.encStats.Window()
 	enc["width"], enc["height"], enc["fps"] = s.info.Width, s.info.Height, s.info.FPS
 	mediaInfo := map[string]any{}
-	if p := s.pipe.Load(); p != nil {
+	if s.sim != nil {
+		sim := s.simSnapshot()
+		hub := s.mgr.hub.Snapshot()
+		for _, l := range hub["layers"].([]simulcast.LayerStatus) {
+			if l.Name == sim["layer"] {
+				enc["width"], enc["height"], enc["fps"] = l.Width, l.Height, l.FPS
+			}
+		}
+		enc["source"] = "shared simulcast renditions (no per-session encoder)"
+		snap["simulcast"] = sim
+		mediaInfo = hub
+	} else if p := s.pipe.Load(); p != nil {
 		pos, loops := p.MediaPosition()
 		mediaInfo = map[string]any{"positionSec": pos, "loops": loops,
 			"framesRead": p.FramesRead.Load(), "audioPages": p.AudioPages.Load()}
@@ -804,6 +847,9 @@ func (s *Session) Close(reason string) {
 		s.cancel()
 		if p := s.pipe.Load(); p != nil {
 			p.Close()
+		}
+		if s.sim != nil && s.sim.sub != nil {
+			s.mgr.hub.Unsubscribe(s.sim.sub)
 		}
 		if s.pc != nil {
 			_ = s.pc.Close()

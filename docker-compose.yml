@@ -15,6 +15,8 @@ services:
       # PUFFER_ALLOW_UPLOAD: "false"
       # PUFFER_VIDEO: "/app/media/your-video.mp4"
       # PUFFER_MAX_BITRATE: "6000000"
+      # Shared simulcast source (e.g. the sfu-test transcoder sending to these ports on this host):
+      # PUFFER_SIMULCAST: "high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k"
     volumes:
       - ./logs:/app/logs
       - ./videos:/app/videos

@@ -2,6 +2,7 @@
 
 build:
 	CGO_ENABLED=1 go build -o bin/server ./cmd/server
+	go build -o bin/simclient ./cmd/simclient
 
 standin: media/standin.mp4
 

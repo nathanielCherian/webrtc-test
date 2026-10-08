@@ -29,7 +29,8 @@ const charts = {
     { key: 'recvVideo', name: 'client video recv' },
     { key: 'ccTarget', name: 'server CC target' },
     { key: 'encOut', name: 'server encoder out' },
-    { key: 'encCfg', name: 'encoder configured' },
+    { key: 'encCfg', name: 'encoder configured / simulcast layer' },
+    { key: 'pad', name: 'server probe padding' },
     { key: 'availIn', name: 'client avail. incoming' },
   ]),
   rtt: new Chart($('c-rtt'), [
@@ -106,6 +107,8 @@ const sessionInputs = ['video-pick', 'rcAlgo', 'waveCenter', 'waveAmp', 'wavePer
 // ---------------------------------------------------------------------------
 // Video library: pick a server-side file, or upload one.
 // ---------------------------------------------------------------------------
+const SIMULCAST = '__simulcast__'; // video-pick value for the shared simulcast source
+
 function describeVideo(info) {
   const dur = info.durationSec ? `, ${Math.round(info.durationSec)} s` : '';
   return `${info.width}×${info.height} @ ${fmtNum(info.fps)} fps${dur}${info.hasAudio ? '' : ', no audio'}`;
@@ -123,14 +126,24 @@ async function loadVideos(select) {
     logEvent('client', 'videosError', err.message);
     return;
   }
-  const keep = select !== undefined ? select : pick.value;
-  pick.replaceChildren(...list.videos.map((v) => {
+  const keep = select !== undefined ? select : (pick.value || (list.simulcast ? SIMULCAST : ''));
+  const options = list.videos.map((v) => {
     const o = document.createElement('option');
     o.value = v.name;
     const base = v.info.path.split('/').pop();
     o.textContent = `${v.default ? base + ' (default)' : v.name} — ${describeVideo(v.info)}`;
     return o;
-  }));
+  });
+  if (list.simulcast) {
+    // Shared pre-encoded renditions: every viewer forwards the same encodes.
+    const o = document.createElement('option');
+    o.value = SIMULCAST;
+    const layers = list.simulcast.layers;
+    const live = layers.some((l) => l.live);
+    o.textContent = `Live simulcast (shared encoder) — ${layers.map((l) => `${l.name} ${Math.round(l.nominalBps / 1000)}k`).join(' / ')}${live ? '' : ' — not receiving'}`;
+    options.unshift(o);
+  }
+  pick.replaceChildren(...options);
   if ([...pick.options].some((o) => o.value === keep)) pick.value = keep;
   $('upload-row').hidden = !list.allowUpload;
   S.maxUploadMB = list.maxUploadMB;
@@ -276,7 +289,8 @@ async function start() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sdp: pc.localDescription.sdp, type: pc.localDescription.type, client: clientInfo(),
-        video: $('video-pick').value || undefined, rateControl: rateControlRequest(),
+        ...($('video-pick').value === SIMULCAST ? { source: 'simulcast' } : { video: $('video-pick').value || undefined }),
+        rateControl: rateControlRequest(),
       }),
     });
     const body = await res.json();
@@ -619,13 +633,14 @@ function onServerMessage(data) {
       S.serverSnaps.push(msg);
       const g = msg.gcc || {}, rc = msg.rateControl || {}, e = msg.encoder || {}, v = (msg.interceptorStats || {}).video || {};
       const ccTarget = rc.targetBitrate !== undefined ? rc.targetBitrate : g.targetBitrate;
-      charts.bitrate.push(recvT, { ccTarget: ccTarget / 1000, encOut: e.outputBitrate / 1000, encCfg: e.configuredBitrate / 1000 });
+      const sim = msg.simulcast;
+      charts.bitrate.push(recvT, { ccTarget: ccTarget / 1000, encOut: e.outputBitrate / 1000, encCfg: e.configuredBitrate / 1000, pad: sim ? sim.paddingBps / 1000 : undefined });
       const rrRtt = ((msg.rtcp || {}).video || {}).rttMs;
       charts.rtt.push(recvT, { serverRtt: v.rttMs > 0 ? v.rttMs : rrRtt });
       charts.fps.push(recvT, { encoded: e.outputFps });
       charts.loss.push(recvT, { serverLoss: v.fractionLost !== undefined ? 100 * v.fractionLost : undefined, gccLoss: g.averageLoss !== undefined ? 100 * g.averageLoss : undefined });
       charts.delay.push(recvT, { gccDelay: g.delayEstimate });
-      const view = { rateControl: msg.rateControl, gcc: msg.gcc, encoder: e, media: msg.media, rtcp: msg.rtcp, rtp: { video: v.outbound, audio: ((msg.interceptorStats || {}).audio || {}).outbound }, state: msg.state, selectedCandidatePair: msg.selectedCandidatePair };
+      const view = { rateControl: msg.rateControl, simulcast: sim, gcc: msg.gcc, encoder: e, media: msg.media, rtcp: msg.rtcp, rtp: { video: v.outbound, audio: ((msg.interceptorStats || {}).audio || {}).outbound }, state: msg.state, selectedCandidatePair: msg.selectedCandidatePair };
       $('t-server').innerHTML = kvHTML(view);
       $('t-server-raw').textContent = JSON.stringify(msg, null, 2);
       break;
