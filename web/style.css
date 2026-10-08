@@ -65,6 +65,9 @@ button:disabled { opacity: .45; cursor: default; }
   color: var(--muted);
 }
 .settings[open] > label[hidden] { display: none; }
+.settings input[type=file] { display: block; margin-top: 4px; max-width: 260px; }
+.upload-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+#upload-status { font-variant-numeric: tabular-nums; }
 .settings input[type=number], .settings input[type=text], .settings select {
   display: block; width: 260px; margin-top: 2px; padding: 4px 6px;
   font: inherit; color: var(--text); background: var(--bg);

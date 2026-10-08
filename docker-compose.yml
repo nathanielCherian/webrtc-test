@@ -10,8 +10,12 @@ services:
       PUFFER_UDP_PORT: "50000"
       # Cloud VMs (AWS/GCP/Azure) whose public IP is not on an interface:
       # PUFFER_PUBLIC_IP: "203.0.113.10"
+      # Videos the page can pick from and upload to (kept on the host in ./videos).
+      PUFFER_MEDIA_DIR: "/app/videos"
+      # PUFFER_ALLOW_UPLOAD: "false"
       # PUFFER_VIDEO: "/app/media/your-video.mp4"
       # PUFFER_MAX_BITRATE: "6000000"
     volumes:
       - ./logs:/app/logs
+      - ./videos:/app/videos
       # - ./media/your-video.mp4:/app/media/your-video.mp4:ro

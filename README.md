@@ -25,7 +25,7 @@ Open TCP **8080** and UDP **50000** in the firewall, then browse to `http://<ser
 
 - **macOS (Docker Desktop):** host networking only reaches Docker's Linux VM, so use the override that publishes the ports and advertises `127.0.0.1`: `docker compose -f docker-compose.yml -f docker-compose.mac.yml up --build` (or `make docker-mac`). Set `PUFFER_HOST_HTTP_PORT` if 8080 is taken on the Mac.
 - **Cloud VMs:** if the public IP is not on a network interface (AWS, GCP), set `PUFFER_PUBLIC_IP=<public ip>` in `docker-compose.yml`. The server then puts that IP in its ICE candidates.
-- **Your own video:** mount the file and set `PUFFER_VIDEO` (see the commented lines in `docker-compose.yml`). The server probes resolution and frame rate at startup. Any container or codec that ffmpeg can decode works.
+- **Your own video:** pick or upload one on the page (see [Choosing the video](#choosing-the-video)). With Compose, the library is `./videos` on the host, so you can also copy files there. To change the *default* video, mount the file and set `PUFFER_VIDEO` (see the commented lines in `docker-compose.yml`).
 - **HTTPS:** a receive-only page works over plain http. For HTTPS, pass `--tls-cert` and `--tls-key`, or put the server behind a reverse proxy. Only `/offer` and the static files go through HTTP; media always goes to the UDP port directly.
 - **CPU cost:** each viewer uses one ffmpeg decode and one x264 encode, about one core at 720p30 with the `veryfast` preset. `--max-sessions` (default 8) sets the cap.
 
@@ -42,7 +42,10 @@ Every flag can also be set as an environment variable: `--foo-bar` becomes `PUFF
 
 | flag | default | |
 |---|---|---|
-| `--video` | `media/standin.mp4` | source file, looped forever |
+| `--video` | `media/standin.mp4` | default source file, looped forever |
+| `--media-dir` | the `--video` file's directory | videos the page can choose from and upload to |
+| `--allow-upload` | true | allow uploads from the page to `--media-dir` |
+| `--max-upload-mb` | 2048 | largest accepted upload |
 | `--http-addr` | `:8080` | |
 | `--udp-port` | `50000` | single UDP port for all media (0 = ephemeral) |
 | `--public-ip` | | IPs to advertise instead of the interface IPs (1:1 NAT) |
@@ -126,6 +129,14 @@ Each session writes `logs/<UTC time>_<session>.jsonl`. Every line is `{"t": <ser
 The browser sends its stats over the DataChannel. Every 4th tick it sends the full report; on the other ticks it sends only the parts that change.
 
 The **Download JSON** button saves everything the client collected, including every rendered-frame record.
+
+## Choosing the video
+
+**Settings → Video** on the downlink page lists the `--video` default first, then every file in `--media-dir` that ffmpeg can play, with its resolution, frame rate and length. Each session can use a different video, and the server probes each file when you first select it (results are cached). **Upload** adds a file from your computer to `--media-dir`. The server checks that ffmpeg can play it, rejects names that already exist, and selects it once the upload finishes. Uploads can be turned off with `--allow-upload=false`.
+
+The chosen file is recorded in the session's `meta` record and `server-hello` (`media.path`). The API is `GET /videos` for the listing, `POST /videos?name=<file>` with the raw file as the body to upload, and `"video": "<file>"` in the `/offer` body (omit it for the default).
+
+Anyone who can open the page can upload. On a public server, set `--allow-upload=false` or put it behind a reverse proxy with authentication.
 
 ## Rate control
 

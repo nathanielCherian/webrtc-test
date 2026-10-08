@@ -100,8 +100,77 @@ $('start').onclick = start;
 $('stop').onclick = () => stop('user stop');
 $('download').onclick = download;
 
+// Settings that apply to the next session and are locked while one runs.
+const sessionInputs = ['video-pick', 'rcAlgo', 'sineCenter', 'sineAmp', 'sinePeriod'];
+
+// ---------------------------------------------------------------------------
+// Video library: pick a server-side file, or upload one.
+// ---------------------------------------------------------------------------
+function describeVideo(info) {
+  const dur = info.durationSec ? `, ${Math.round(info.durationSec)} s` : '';
+  return `${info.width}×${info.height} @ ${fmtNum(info.fps)} fps${dur}${info.hasAudio ? '' : ', no audio'}`;
+}
+
+async function loadVideos(select) {
+  const pick = $('video-pick');
+  let list;
+  try {
+    const res = await fetch('videos');
+    list = await res.json();
+    if (!res.ok) throw new Error(list.error || res.statusText);
+  } catch (err) {
+    pick.innerHTML = '<option value="">server default</option>';
+    logEvent('client', 'videosError', err.message);
+    return;
+  }
+  const keep = select !== undefined ? select : pick.value;
+  pick.replaceChildren(...list.videos.map((v) => {
+    const o = document.createElement('option');
+    o.value = v.name;
+    const base = v.info.path.split('/').pop();
+    o.textContent = `${v.default ? base + ' (default)' : v.name} — ${describeVideo(v.info)}`;
+    return o;
+  }));
+  if ([...pick.options].some((o) => o.value === keep)) pick.value = keep;
+  $('upload-row').hidden = !list.allowUpload;
+  S.maxUploadMB = list.maxUploadMB;
+}
+
+$('upload-file').onchange = () => { $('upload-btn').disabled = !$('upload-file').files.length; $('upload-status').textContent = ''; };
+$('upload-btn').onclick = () => {
+  const file = $('upload-file').files[0];
+  if (!file) return;
+  const status = $('upload-status');
+  if (S.maxUploadMB && file.size > S.maxUploadMB * 1048576) {
+    status.textContent = `too large (limit ${S.maxUploadMB} MB)`;
+    return;
+  }
+  // XHR rather than fetch for upload progress. The body is the raw file.
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', 'videos?name=' + encodeURIComponent(file.name));
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable) status.textContent = `${Math.floor(100 * e.loaded / e.total)}%`; };
+  xhr.upload.onload = () => { status.textContent = 'checking…'; };
+  xhr.onload = async () => {
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+    $('upload-btn').disabled = false;
+    if (xhr.status !== 200) {
+      status.textContent = 'failed: ' + (body.error || xhr.statusText);
+      return;
+    }
+    status.textContent = 'uploaded';
+    logEvent('client', 'videoUploaded', `${file.name} (${describeVideo(body)})`);
+    $('upload-file').value = '';
+    await loadVideos(file.name);
+  };
+  xhr.onerror = () => { $('upload-btn').disabled = false; status.textContent = 'failed: network error'; };
+  $('upload-btn').disabled = true;
+  status.textContent = '0%';
+  xhr.send(file);
+};
+loadVideos();
+
 // Rate control settings: the sine inputs only apply to the sine algorithm.
-const rcInputs = ['rcAlgo', 'sineCenter', 'sineAmp', 'sinePeriod'];
 function updateRateControlUI() {
   const sine = $('rcAlgo').value === 'sine';
   for (const el of document.querySelectorAll('.sine-opt')) el.hidden = !sine;
@@ -147,7 +216,7 @@ function newQoE() {
 async function start() {
   $('start').disabled = true;
   $('download').disabled = false;
-  for (const id of rcInputs) $(id).disabled = true;
+  for (const id of sessionInputs) $(id).disabled = true;
   Object.assign(S, {
     statsSamples: [], frames: [], events: [], serverSnaps: [], serverHello: null, prev: null,
     pendingFrames: [], pendingEvents: [], tick: 0, qoe: newQoE(),
@@ -204,7 +273,7 @@ async function start() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sdp: pc.localDescription.sdp, type: pc.localDescription.type, client: clientInfo(),
-        rateControl: rateControlRequest(),
+        video: $('video-pick').value || undefined, rateControl: rateControlRequest(),
       }),
     });
     const body = await res.json();
@@ -243,7 +312,7 @@ function stop(reason) {
   setStatus('stopped: ' + reason);
   $('start').disabled = false;
   $('stop').disabled = true;
-  for (const id of rcInputs) $(id).disabled = false;
+  for (const id of sessionInputs) $(id).disabled = false;
 }
 
 function clientInfo() {
@@ -536,7 +605,7 @@ function onServerMessage(data) {
   switch (msg.type) {
     case 'server-hello':
       S.serverHello = { ...msg, clientRecvT: recvT };
-      logEvent('server', 'hello', `${msg.media.width}x${msg.media.height}@${fmtNum(msg.media.fps)} from ${msg.host.hostname}`);
+      logEvent('server', 'hello', `${msg.media.path.split('/').pop()} ${msg.media.width}x${msg.media.height}@${fmtNum(msg.media.fps)} from ${msg.host.hostname}`);
       if (msg.rateControl) logEvent('server', 'rateControl', describeRateControl(msg.rateControl));
       break;
     case 'server-event':

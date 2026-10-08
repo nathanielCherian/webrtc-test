@@ -16,6 +16,11 @@
     <button id="download" disabled>Download JSON</button>
     <details class="settings">
       <summary>Settings</summary>
+      <label>Video <select id="video-pick"><option value="">loading…</option></select></label>
+      <label id="upload-row">Upload a video (saved to the server's media folder)
+        <input id="upload-file" type="file" accept="video/*,.mkv,.mov,.ts,.y4m">
+        <span class="upload-actions"><button id="upload-btn" type="button" disabled>Upload</button> <span id="upload-status"></span></span>
+      </label>
       <label>Stats interval (ms) <input id="interval" type="number" value="250" min="50" step="50"></label>
       <label>Jitter buffer target (ms, blank = browser default) <input id="jbTarget" type="number" min="0" step="10"></label>
       <label>STUN URL (optional) <input id="stun" type="text" placeholder="stun:stun.l.google.com:19302"></label>

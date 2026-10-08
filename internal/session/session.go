@@ -54,7 +54,8 @@ type Config struct {
 // Manager creates and tracks sessions.
 type Manager struct {
 	cfg      Config
-	info     *MediaInfo
+	info     *MediaInfo // default video
+	lib      *Library
 	settings webrtc.SettingEngine
 	host     map[string]any
 
@@ -63,8 +64,9 @@ type Manager struct {
 }
 
 // NewManager creates a manager. settings is copied into every session's API.
-func NewManager(cfg Config, info *MediaInfo, settings webrtc.SettingEngine, host map[string]any) *Manager {
-	return &Manager{cfg: cfg, info: info, settings: settings, host: host, sessions: map[string]*Session{}}
+// Downlink sessions pick their video from lib (lib.Default if none is given).
+func NewManager(cfg Config, lib *Library, settings webrtc.SettingEngine, host map[string]any) *Manager {
+	return &Manager{cfg: cfg, info: lib.Default, lib: lib, settings: settings, host: host, sessions: map[string]*Session{}}
 }
 
 // ActiveSessions returns the number of live sessions.
@@ -80,6 +82,8 @@ type OfferRequest struct {
 	Type   string          `json:"type"`
 	Client json.RawMessage `json:"client,omitempty"` // arbitrary client metadata, logged
 	Mode   string          `json:"mode,omitempty"`   // "" or "downlink": server sends; "uplink": browser sends
+	// Video is a file name from the media library; "" means the --video default.
+	Video string `json:"video,omitempty"`
 	// RateControl picks the downlink bandwidth estimator; nil means GCC.
 	RateControl *RateControlRequest `json:"rateControl,omitempty"`
 }
@@ -176,7 +180,13 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
 	}
-	s := &Session{id: newID(), mode: req.Mode, rc: rc, sine: sine, mgr: m, cfg: m.cfg, info: m.info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
+	info := m.info
+	if req.Mode != ModeUplink {
+		if info, err = m.lib.Get(ctx, req.Video); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
+		}
+	}
+	s := &Session{id: newID(), mode: req.Mode, rc: rc, sine: sine, mgr: m, cfg: m.cfg, info: info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
 	s.clockOffset.Store(math.Float64bits(math.NaN()))
 	s.clockRTT.Store(math.Float64bits(math.NaN()))
 	s.ctx, s.cancel = context.WithCancel(context.Background())
@@ -189,7 +199,7 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	}
 	s.log.Log("meta", "session", map[string]any{
 		"sessionId": s.id, "mode": s.mode, "remoteAddr": remoteAddr, "client": req.Client,
-		"media": m.info, "config": m.cfg, "host": m.host, "rateControl": s.rateControlInfo(),
+		"media": s.info, "config": m.cfg, "host": m.host, "rateControl": s.rateControlInfo(),
 	})
 
 	if err := s.setup(ctx, req); err != nil {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -37,7 +39,10 @@ func main() {
 		httpAddr     = flag.String("http-addr", ":8080", "HTTP(S) listen address")
 		tlsCert      = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
 		tlsKey       = flag.String("tls-key", "", "TLS key file")
-		videoPath    = flag.String("video", "media/standin.mp4", "source video file (looped)")
+		videoPath    = flag.String("video", "media/standin.mp4", "default source video file (looped)")
+		mediaDir     = flag.String("media-dir", "", "directory of videos the page can choose from and upload to (default: the --video file's directory)")
+		allowUpload  = flag.Bool("allow-upload", true, "allow uploading videos to --media-dir from the page")
+		maxUploadMB  = flag.Int64("max-upload-mb", 2048, "largest accepted upload (MB)")
 		publicIP     = flag.String("public-ip", "", "public IP(s) to advertise in ICE host candidates, comma-separated (for cloud VMs behind 1:1 NAT)")
 		udpPort      = flag.Int("udp-port", 50000, "single UDP port for all WebRTC media (0 = ephemeral ports)")
 		stunURLs     = flag.String("stun", "", "STUN server URL(s), comma-separated, e.g. stun:stun.l.google.com:19302")
@@ -115,7 +120,12 @@ func main() {
 		LogDir: *logDir, ConnectTimeout: 30 * time.Second, MaxSessions: *maxSessions, UplinkRecord: *uplinkRecord,
 		ICEServers: iceServers,
 	}
-	mgr := session.NewManager(cfg, info, se, hostInfo(*publicIP, *udpPort))
+	if *mediaDir == "" {
+		*mediaDir = filepath.Dir(*videoPath)
+	}
+	lib := session.NewLibrary(*mediaDir, info, *allowUpload, *maxUploadMB<<20)
+	log.Printf("video library %s (uploads %s)", *mediaDir, map[bool]string{true: "allowed", false: "disabled"}[*allowUpload])
+	mgr := session.NewManager(cfg, lib, se, hostInfo(*publicIP, *udpPort))
 
 	mux := http.NewServeMux()
 	static, _ := fs.Sub(web.FS, ".")
@@ -125,6 +135,30 @@ func main() {
 	})
 	mux.HandleFunc("GET /info", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"media": info, "config": cfg, "sessions": mgr.ActiveSessions()})
+	})
+	mux.HandleFunc("GET /videos", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"videos": lib.List(r.Context()), "allowUpload": lib.AllowUpload, "maxUploadMB": *maxUploadMB})
+	})
+	// The body is the raw file (no multipart), so large uploads stream to disk.
+	mux.HandleFunc("POST /videos", func(w http.ResponseWriter, r *http.Request) {
+		if !lib.AllowUpload {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "uploads are disabled (--allow-upload=false)"})
+			return
+		}
+		name := r.URL.Query().Get("name")
+		info, err := lib.Save(r.Context(), name, http.MaxBytesReader(w, r.Body, lib.MaxUpload))
+		var tooBig *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooBig):
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": fmt.Sprintf("file is larger than %d MB", *maxUploadMB)})
+		case errors.Is(err, session.ErrVideoExists):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		case err != nil:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		default:
+			log.Printf("uploaded %s from %s: %dx%d @ %.3f fps, %.1fs", info.Path, clientAddr(r), info.Width, info.Height, info.FPS, info.DurationSec)
+			writeJSON(w, http.StatusOK, info)
+		}
 	})
 	mux.HandleFunc("POST /offer", func(w http.ResponseWriter, r *http.Request) {
 		var req session.OfferRequest
