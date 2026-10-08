@@ -90,16 +90,18 @@ type OfferRequest struct {
 
 // RateControlRequest selects and parameterises the downlink rate control.
 type RateControlRequest struct {
-	Algorithm     string  `json:"algorithm"` // "gcc" (default) or "sine"
+	Algorithm     string  `json:"algorithm"` // "gcc" (default), "sine" or "square"
 	CenterKbps    float64 `json:"centerKbps,omitempty"`
 	AmplitudeKbps float64 `json:"amplitudeKbps,omitempty"`
 	PeriodSec     float64 `json:"periodSec,omitempty"`
+	DutyPct       float64 `json:"dutyPct,omitempty"` // square: % of the period at the high rate (default 50)
 }
 
 // Rate control algorithms.
 const (
-	RateControlGCC  = "gcc"
-	RateControlSine = "sine"
+	RateControlGCC    = "gcc"
+	RateControlSine   = ratecontrol.ShapeSine
+	RateControlSquare = ratecontrol.ShapeSquare
 )
 
 // ModeUplink is OfferRequest.Mode for sessions where the browser sends media.
@@ -116,8 +118,8 @@ type OfferResponse struct {
 type Session struct {
 	id      string
 	mode    string
-	rc      string                  // RateControlGCC or RateControlSine (downlink only)
-	sine    *ratecontrol.SineParams // set when rc == RateControlSine
+	rc      string                  // RateControlGCC, RateControlSine or RateControlSquare (downlink only)
+	wave    *ratecontrol.WaveParams // set unless rc == RateControlGCC
 	mgr     *Manager
 	cfg     Config
 	info    *MediaInfo
@@ -176,7 +178,7 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	default:
 		return nil, fmt.Errorf("%w: unknown mode %q", ErrBadOffer, req.Mode)
 	}
-	rc, sine, err := m.parseRateControl(req)
+	rc, wave, err := m.parseRateControl(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
 	}
@@ -186,7 +188,7 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 			return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
 		}
 	}
-	s := &Session{id: newID(), mode: req.Mode, rc: rc, sine: sine, mgr: m, cfg: m.cfg, info: info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
+	s := &Session{id: newID(), mode: req.Mode, rc: rc, wave: wave, mgr: m, cfg: m.cfg, info: info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
 	s.clockOffset.Store(math.Float64bits(math.NaN()))
 	s.clockRTT.Store(math.Float64bits(math.NaN()))
 	s.ctx, s.cancel = context.WithCancel(context.Background())
@@ -229,7 +231,7 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 
 // parseRateControl validates the requested rate control. Uplink sessions
 // ignore it.
-func (m *Manager) parseRateControl(req OfferRequest) (string, *ratecontrol.SineParams, error) {
+func (m *Manager) parseRateControl(req OfferRequest) (string, *ratecontrol.WaveParams, error) {
 	if req.Mode == ModeUplink || req.RateControl == nil {
 		return RateControlGCC, nil, nil
 	}
@@ -237,16 +239,23 @@ func (m *Manager) parseRateControl(req OfferRequest) (string, *ratecontrol.SineP
 	switch rc.Algorithm {
 	case "", RateControlGCC:
 		return RateControlGCC, nil, nil
-	case RateControlSine:
-		p := ratecontrol.SineParams{
+	case RateControlSine, RateControlSquare:
+		p := ratecontrol.WaveParams{
+			Shape:        rc.Algorithm,
 			CenterBps:    int(math.Round(rc.CenterKbps * 1000)),
 			AmplitudeBps: int(math.Round(rc.AmplitudeKbps * 1000)),
 			Period:       time.Duration(rc.PeriodSec * float64(time.Second)),
 		}
+		if p.Shape == RateControlSquare {
+			p.Duty = 0.5
+			if rc.DutyPct != 0 {
+				p.Duty = rc.DutyPct / 100
+			}
+		}
 		if err := p.Validate(m.cfg.MaxBitrate); err != nil {
 			return "", nil, err
 		}
-		return RateControlSine, &p, nil
+		return rc.Algorithm, &p, nil
 	default:
 		return "", nil, fmt.Errorf("unknown rate control %q", rc.Algorithm)
 	}
@@ -258,10 +267,13 @@ func (s *Session) rateControlInfo() map[string]any {
 		return nil
 	}
 	info := map[string]any{"algorithm": s.rc}
-	if s.sine != nil {
-		info["centerBps"] = s.sine.CenterBps
-		info["amplitudeBps"] = s.sine.AmplitudeBps
-		info["periodSec"] = s.sine.Period.Seconds()
+	if s.wave != nil {
+		info["centerBps"] = s.wave.CenterBps
+		info["amplitudeBps"] = s.wave.AmplitudeBps
+		info["periodSec"] = s.wave.Period.Seconds()
+		if s.wave.Shape == RateControlSquare {
+			info["duty"] = s.wave.Duty
+		}
 	}
 	return info
 }
@@ -369,7 +381,7 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 }
 
 // configureDownlink registers the send-side codecs and the bandwidth estimator
-// (GCC, or the open-loop sine wave). It returns the channel that receives the
+// (GCC, or an open-loop sine/square wave). It returns the channel that receives the
 // session's bandwidth estimator.
 func (s *Session) configureDownlink(me *webrtc.MediaEngine, ir *interceptor.Registry) (chan cc.BandwidthEstimator, error) {
 	if err := registerCodecs(me); err != nil {
@@ -379,8 +391,8 @@ func (s *Session) configureDownlink(me *webrtc.MediaEngine, ir *interceptor.Regi
 	// packets flow NACK buffer -> stats -> TWCC seq numbering -> GCC pacer -> wire.
 	bweCh := make(chan cc.BandwidthEstimator, 1)
 	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
-		if s.sine != nil {
-			return ratecontrol.NewSine(*s.sine), nil
+		if s.wave != nil {
+			return ratecontrol.NewWave(*s.wave), nil
 		}
 		return gcc.NewSendSideBWE(
 			gcc.SendSideBWEInitialBitrate(s.cfg.StartBitrate),
@@ -475,8 +487,8 @@ func (s *Session) run() {
 	if s.cfg.KeyIntSec > 0 {
 		keyint = int(math.Round(s.cfg.KeyIntSec * s.info.FPS))
 	}
-	if sine, ok := s.bwe.(*ratecontrol.Sine); ok {
-		sine.Start()
+	if wave, ok := s.bwe.(*ratecontrol.Wave); ok {
+		wave.Start()
 	}
 	initial := s.videoBitrateFor(s.bwe.GetTargetBitrate())
 	s.enc, err = x264.New(x264.Config{

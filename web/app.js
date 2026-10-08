@@ -101,7 +101,7 @@ $('stop').onclick = () => stop('user stop');
 $('download').onclick = download;
 
 // Settings that apply to the next session and are locked while one runs.
-const sessionInputs = ['video-pick', 'rcAlgo', 'sineCenter', 'sineAmp', 'sinePeriod'];
+const sessionInputs = ['video-pick', 'rcAlgo', 'waveCenter', 'waveAmp', 'wavePeriod', 'waveDuty'];
 
 // ---------------------------------------------------------------------------
 // Video library: pick a server-side file, or upload one.
@@ -170,21 +170,24 @@ $('upload-btn').onclick = () => {
 };
 loadVideos();
 
-// Rate control settings: the sine inputs only apply to the sine algorithm.
+// Rate control settings: the wave inputs only apply to the sine/square algorithms.
 function updateRateControlUI() {
-  const sine = $('rcAlgo').value === 'sine';
-  for (const el of document.querySelectorAll('.sine-opt')) el.hidden = !sine;
+  const algo = $('rcAlgo').value;
+  for (const el of document.querySelectorAll('.wave-opt')) el.hidden = algo === 'gcc';
+  for (const el of document.querySelectorAll('.square-opt')) el.hidden = algo !== 'square';
 }
 $('rcAlgo').onchange = updateRateControlUI;
 updateRateControlUI();
 
 function rateControlRequest() {
-  if ($('rcAlgo').value !== 'sine') return undefined;
+  const algo = $('rcAlgo').value;
+  if (algo === 'gcc') return undefined;
   return {
-    algorithm: 'sine',
-    centerKbps: Number($('sineCenter').value),
-    amplitudeKbps: Number($('sineAmp').value),
-    periodSec: Number($('sinePeriod').value),
+    algorithm: algo,
+    centerKbps: Number($('waveCenter').value),
+    amplitudeKbps: Number($('waveAmp').value),
+    periodSec: Number($('wavePeriod').value),
+    dutyPct: algo === 'square' ? Number($('waveDuty').value) : undefined,
   };
 }
 
@@ -631,8 +634,10 @@ function onServerMessage(data) {
 }
 
 function describeRateControl(rc) {
-  if (rc.algorithm !== 'sine') return rc.algorithm;
-  return `sine ${rc.centerBps / 1000} ± ${rc.amplitudeBps / 1000} kbps, period ${rc.periodSec} s`;
+  const c = rc.centerBps / 1000, a = rc.amplitudeBps / 1000;
+  if (rc.algorithm === 'sine') return `sine ${c} ± ${a} kbps, period ${rc.periodSec} s`;
+  if (rc.algorithm === 'square') return `square ${c + a} / ${c - a} kbps, period ${rc.periodSec} s, ${Math.round(rc.duty * 100)}% high`;
+  return rc.algorithm;
 }
 
 function sendToServer(obj) { sendOnChannel(S.dc, obj); }
