@@ -27,7 +27,7 @@ const video = $('video');
 const charts = {
   bitrate: new Chart($('c-bitrate'), [
     { key: 'recvVideo', name: 'client video recv' },
-    { key: 'gccTarget', name: 'server GCC target' },
+    { key: 'ccTarget', name: 'server CC target' },
     { key: 'encOut', name: 'server encoder out' },
     { key: 'encCfg', name: 'encoder configured' },
     { key: 'availIn', name: 'client avail. incoming' },
@@ -100,6 +100,25 @@ $('start').onclick = start;
 $('stop').onclick = () => stop('user stop');
 $('download').onclick = download;
 
+// Rate control settings: the sine inputs only apply to the sine algorithm.
+const rcInputs = ['rcAlgo', 'sineCenter', 'sineAmp', 'sinePeriod'];
+function updateRateControlUI() {
+  const sine = $('rcAlgo').value === 'sine';
+  for (const el of document.querySelectorAll('.sine-opt')) el.hidden = !sine;
+}
+$('rcAlgo').onchange = updateRateControlUI;
+updateRateControlUI();
+
+function rateControlRequest() {
+  if ($('rcAlgo').value !== 'sine') return undefined;
+  return {
+    algorithm: 'sine',
+    centerKbps: Number($('sineCenter').value),
+    amplitudeKbps: Number($('sineAmp').value),
+    periodSec: Number($('sinePeriod').value),
+  };
+}
+
 function setStatus(s) { $('status').textContent = s; }
 
 function newQoE() {
@@ -128,6 +147,7 @@ function newQoE() {
 async function start() {
   $('start').disabled = true;
   $('download').disabled = false;
+  for (const id of rcInputs) $(id).disabled = true;
   Object.assign(S, {
     statsSamples: [], frames: [], events: [], serverSnaps: [], serverHello: null, prev: null,
     pendingFrames: [], pendingEvents: [], tick: 0, qoe: newQoE(),
@@ -182,7 +202,10 @@ async function start() {
     const res = await fetch('offer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, client: clientInfo() }),
+      body: JSON.stringify({
+        sdp: pc.localDescription.sdp, type: pc.localDescription.type, client: clientInfo(),
+        rateControl: rateControlRequest(),
+      }),
     });
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || res.statusText);
@@ -220,6 +243,7 @@ function stop(reason) {
   setStatus('stopped: ' + reason);
   $('start').disabled = false;
   $('stop').disabled = true;
+  for (const id of rcInputs) $(id).disabled = false;
 }
 
 function clientInfo() {
@@ -488,7 +512,7 @@ function renderQoE() {
     ['Frames dropped', s.framesDropped, ''],
     ['Audio concealed', s.audioConcealedPct, '%'],
     ['Avg video', s.avgVideoKbps, 'kbps'],
-    ['GCC target', lastServer()?.gcc?.targetBitrate / 1000, 'kbps'],
+    ['CC target', (lastServer()?.rateControl ?? lastServer()?.gcc)?.targetBitrate / 1000, 'kbps'],
   ];
   $('qoe').innerHTML = tilesHTML(tiles);
 }
@@ -513,6 +537,7 @@ function onServerMessage(data) {
     case 'server-hello':
       S.serverHello = { ...msg, clientRecvT: recvT };
       logEvent('server', 'hello', `${msg.media.width}x${msg.media.height}@${fmtNum(msg.media.fps)} from ${msg.host.hostname}`);
+      if (msg.rateControl) logEvent('server', 'rateControl', describeRateControl(msg.rateControl));
       break;
     case 'server-event':
       logEvent('server', msg.event.kind, msg.event.value, { serverT: msg.event.t });
@@ -520,19 +545,25 @@ function onServerMessage(data) {
     case 'server-stats': {
       msg.clientRecvT = recvT;
       S.serverSnaps.push(msg);
-      const g = msg.gcc || {}, e = msg.encoder || {}, v = (msg.interceptorStats || {}).video || {};
-      charts.bitrate.push(recvT, { gccTarget: g.targetBitrate / 1000, encOut: e.outputBitrate / 1000, encCfg: e.configuredBitrate / 1000 });
+      const g = msg.gcc || {}, rc = msg.rateControl || {}, e = msg.encoder || {}, v = (msg.interceptorStats || {}).video || {};
+      const ccTarget = rc.targetBitrate !== undefined ? rc.targetBitrate : g.targetBitrate;
+      charts.bitrate.push(recvT, { ccTarget: ccTarget / 1000, encOut: e.outputBitrate / 1000, encCfg: e.configuredBitrate / 1000 });
       const rrRtt = ((msg.rtcp || {}).video || {}).rttMs;
       charts.rtt.push(recvT, { serverRtt: v.rttMs > 0 ? v.rttMs : rrRtt });
       charts.fps.push(recvT, { encoded: e.outputFps });
       charts.loss.push(recvT, { serverLoss: v.fractionLost !== undefined ? 100 * v.fractionLost : undefined, gccLoss: g.averageLoss !== undefined ? 100 * g.averageLoss : undefined });
       charts.delay.push(recvT, { gccDelay: g.delayEstimate });
-      const view = { gcc: g, encoder: e, media: msg.media, rtcp: msg.rtcp, rtp: { video: v.outbound, audio: ((msg.interceptorStats || {}).audio || {}).outbound }, state: msg.state, selectedCandidatePair: msg.selectedCandidatePair };
+      const view = { rateControl: msg.rateControl, gcc: msg.gcc, encoder: e, media: msg.media, rtcp: msg.rtcp, rtp: { video: v.outbound, audio: ((msg.interceptorStats || {}).audio || {}).outbound }, state: msg.state, selectedCandidatePair: msg.selectedCandidatePair };
       $('t-server').innerHTML = kvHTML(view);
       $('t-server-raw').textContent = JSON.stringify(msg, null, 2);
       break;
     }
   }
+}
+
+function describeRateControl(rc) {
+  if (rc.algorithm !== 'sine') return rc.algorithm;
+  return `sine ${rc.centerBps / 1000} ± ${rc.amplitudeBps / 1000} kbps, period ${rc.periodSec} s`;
 }
 
 function sendToServer(obj) { sendOnChannel(S.dc, obj); }

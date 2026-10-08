@@ -23,12 +23,16 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
+	"puffer-webrtc/internal/ratecontrol"
 	"puffer-webrtc/internal/telemetry"
 	"puffer-webrtc/internal/x264"
 )
 
 // ErrTooManySessions is returned when --max-sessions is reached.
 var ErrTooManySessions = errors.New("too many active sessions")
+
+// ErrBadOffer wraps problems with the offer request itself (reported as 400).
+var ErrBadOffer = errors.New("bad offer")
 
 // Config holds per-session tunables (set from flags).
 type Config struct {
@@ -76,7 +80,23 @@ type OfferRequest struct {
 	Type   string          `json:"type"`
 	Client json.RawMessage `json:"client,omitempty"` // arbitrary client metadata, logged
 	Mode   string          `json:"mode,omitempty"`   // "" or "downlink": server sends; "uplink": browser sends
+	// RateControl picks the downlink bandwidth estimator; nil means GCC.
+	RateControl *RateControlRequest `json:"rateControl,omitempty"`
 }
+
+// RateControlRequest selects and parameterises the downlink rate control.
+type RateControlRequest struct {
+	Algorithm     string  `json:"algorithm"` // "gcc" (default) or "sine"
+	CenterKbps    float64 `json:"centerKbps,omitempty"`
+	AmplitudeKbps float64 `json:"amplitudeKbps,omitempty"`
+	PeriodSec     float64 `json:"periodSec,omitempty"`
+}
+
+// Rate control algorithms.
+const (
+	RateControlGCC  = "gcc"
+	RateControlSine = "sine"
+)
 
 // ModeUplink is OfferRequest.Mode for sessions where the browser sends media.
 const ModeUplink = "uplink"
@@ -92,6 +112,8 @@ type OfferResponse struct {
 type Session struct {
 	id      string
 	mode    string
+	rc      string                  // RateControlGCC or RateControlSine (downlink only)
+	sine    *ratecontrol.SineParams // set when rc == RateControlSine
 	mgr     *Manager
 	cfg     Config
 	info    *MediaInfo
@@ -148,9 +170,13 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 		req.Mode = "downlink"
 	case ModeUplink:
 	default:
-		return nil, fmt.Errorf("unknown mode %q", req.Mode)
+		return nil, fmt.Errorf("%w: unknown mode %q", ErrBadOffer, req.Mode)
 	}
-	s := &Session{id: newID(), mode: req.Mode, mgr: m, cfg: m.cfg, info: m.info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
+	rc, sine, err := m.parseRateControl(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
+	}
+	s := &Session{id: newID(), mode: req.Mode, rc: rc, sine: sine, mgr: m, cfg: m.cfg, info: m.info, created: time.Now(), encStats: telemetry.NewEncoderStats()}
 	s.clockOffset.Store(math.Float64bits(math.NaN()))
 	s.clockRTT.Store(math.Float64bits(math.NaN()))
 	s.ctx, s.cancel = context.WithCancel(context.Background())
@@ -158,13 +184,12 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	if s.mode == ModeUplink {
 		logName += "_uplink"
 	}
-	var err error
 	if s.log, err = telemetry.NewLogger(m.cfg.LogDir, logName); err != nil {
 		return nil, fmt.Errorf("create log: %w", err)
 	}
 	s.log.Log("meta", "session", map[string]any{
 		"sessionId": s.id, "mode": s.mode, "remoteAddr": remoteAddr, "client": req.Client,
-		"media": m.info, "config": m.cfg, "host": m.host,
+		"media": m.info, "config": m.cfg, "host": m.host, "rateControl": s.rateControlInfo(),
 	})
 
 	if err := s.setup(ctx, req); err != nil {
@@ -190,6 +215,45 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	s.log.Log("meta", "answer", map[string]any{"offer": req.SDP, "answer": ld.SDP})
 	log.Printf("[%s] new %s session from %s (log: %s)", s.id, s.mode, remoteAddr, s.log.Path)
 	return &OfferResponse{SDP: ld.SDP, Type: ld.Type.String(), SessionID: s.id}, nil
+}
+
+// parseRateControl validates the requested rate control. Uplink sessions
+// ignore it.
+func (m *Manager) parseRateControl(req OfferRequest) (string, *ratecontrol.SineParams, error) {
+	if req.Mode == ModeUplink || req.RateControl == nil {
+		return RateControlGCC, nil, nil
+	}
+	rc := req.RateControl
+	switch rc.Algorithm {
+	case "", RateControlGCC:
+		return RateControlGCC, nil, nil
+	case RateControlSine:
+		p := ratecontrol.SineParams{
+			CenterBps:    int(math.Round(rc.CenterKbps * 1000)),
+			AmplitudeBps: int(math.Round(rc.AmplitudeKbps * 1000)),
+			Period:       time.Duration(rc.PeriodSec * float64(time.Second)),
+		}
+		if err := p.Validate(m.cfg.MaxBitrate); err != nil {
+			return "", nil, err
+		}
+		return RateControlSine, &p, nil
+	default:
+		return "", nil, fmt.Errorf("unknown rate control %q", rc.Algorithm)
+	}
+}
+
+// rateControlInfo describes the configured rate control for logs and hello.
+func (s *Session) rateControlInfo() map[string]any {
+	if s.mode == ModeUplink {
+		return nil
+	}
+	info := map[string]any{"algorithm": s.rc}
+	if s.sine != nil {
+		info["centerBps"] = s.sine.CenterBps
+		info["amplitudeBps"] = s.sine.AmplitudeBps
+		info["periodSec"] = s.sine.Period.Seconds()
+	}
+	return info
 }
 
 func (s *Session) setup(ctx context.Context, req OfferRequest) error {
@@ -266,7 +330,7 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 			s.send(map[string]any{
 				"type": "server-hello", "sessionId": s.id, "serverTimeMs": telemetry.NowMs(),
 				"mode": s.mode, "media": s.info, "config": s.cfg, "host": s.mgr.host,
-				"videoSsrc": s.videoSSRC, "audioSsrc": s.audioSSRC, "logFile": s.log.Path,
+				"rateControl": s.rateControlInfo(), "videoSsrc": s.videoSSRC, "audioSsrc": s.audioSSRC, "logFile": s.log.Path,
 			})
 		})
 		dc.OnClose(func() { s.event("dataChannel", "closed") })
@@ -294,8 +358,9 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 	return nil
 }
 
-// configureDownlink registers the send-side codecs and GCC. It returns the
-// channel that receives the session's bandwidth estimator.
+// configureDownlink registers the send-side codecs and the bandwidth estimator
+// (GCC, or the open-loop sine wave). It returns the channel that receives the
+// session's bandwidth estimator.
 func (s *Session) configureDownlink(me *webrtc.MediaEngine, ir *interceptor.Registry) (chan cc.BandwidthEstimator, error) {
 	if err := registerCodecs(me); err != nil {
 		return nil, err
@@ -304,6 +369,9 @@ func (s *Session) configureDownlink(me *webrtc.MediaEngine, ir *interceptor.Regi
 	// packets flow NACK buffer -> stats -> TWCC seq numbering -> GCC pacer -> wire.
 	bweCh := make(chan cc.BandwidthEstimator, 1)
 	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+		if s.sine != nil {
+			return ratecontrol.NewSine(*s.sine), nil
+		}
 		return gcc.NewSendSideBWE(
 			gcc.SendSideBWEInitialBitrate(s.cfg.StartBitrate),
 			gcc.SendSideBWEMinBitrate(s.cfg.MinBitrate),
@@ -397,6 +465,9 @@ func (s *Session) run() {
 	if s.cfg.KeyIntSec > 0 {
 		keyint = int(math.Round(s.cfg.KeyIntSec * s.info.FPS))
 	}
+	if sine, ok := s.bwe.(*ratecontrol.Sine); ok {
+		sine.Start()
+	}
 	initial := s.videoBitrateFor(s.bwe.GetTargetBitrate())
 	s.enc, err = x264.New(x264.Config{
 		Width: s.info.Width, Height: s.info.Height, FPSNum: s.info.FPSNum, FPSDen: s.info.FPSDen,
@@ -426,7 +497,7 @@ func (s *Session) run() {
 	go s.telemetryLoop()
 }
 
-// videoBitrateFor converts a GCC target (all streams, incl. overhead) into an
+// videoBitrateFor converts a bandwidth estimator target (all streams, incl. overhead) into an
 // encoder target.
 func (s *Session) videoBitrateFor(target int) int {
 	v := int(float64(target)*s.cfg.Headroom) - s.cfg.AudioBitrate
@@ -599,11 +670,21 @@ func (s *Session) snapshot(full bool) map[string]any {
 	return snap
 }
 
-// downlinkSnapshot adds the GCC, encoder and sender-side RTCP sections.
+// downlinkSnapshot adds the rate control (and GCC), encoder and sender-side
+// RTCP sections.
 func (s *Session) downlinkSnapshot(snap map[string]any) {
-	gccStats := map[string]any{"targetBitrate": s.bwe.GetTargetBitrate()}
-	for k, v := range s.bwe.GetStats() {
-		gccStats[k] = v
+	target := s.bwe.GetTargetBitrate()
+	if s.rc == RateControlGCC {
+		gccStats := map[string]any{"targetBitrate": target}
+		for k, v := range s.bwe.GetStats() {
+			gccStats[k] = v
+		}
+		snap["gcc"] = gccStats
+		snap["rateControl"] = map[string]any{"algorithm": RateControlGCC, "targetBitrate": target}
+	} else {
+		rc := s.bwe.GetStats()
+		rc["targetBitrate"] = target
+		snap["rateControl"] = rc
 	}
 	enc := s.encStats.Window()
 	enc["width"], enc["height"], enc["fps"] = s.info.Width, s.info.Height, s.info.FPS
@@ -613,7 +694,6 @@ func (s *Session) downlinkSnapshot(snap map[string]any) {
 		mediaInfo = map[string]any{"positionSec": pos, "loops": loops,
 			"framesRead": p.FramesRead.Load(), "audioPages": p.AudioPages.Load()}
 	}
-	snap["gcc"] = gccStats
 	snap["encoder"] = enc
 	snap["media"] = mediaInfo
 	snap["rtcp"] = map[string]any{"video": s.rtcpVideo.Snapshot(), "audio": s.rtcpAudio.Snapshot()}

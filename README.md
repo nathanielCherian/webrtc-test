@@ -12,6 +12,7 @@ RTCP PLI/FIR ─► force IDR     server telemetry ◄── DataChannel "teleme
 - **Live encoding per viewer:** the encoder bitrate follows Pion's send-side Google Congestion Control (GCC), which works like a real WebRTC sender. With `--headroom 0.9`, the video bitrate is set to `0.9 × GCC target − audio bitrate`.
 - **Codecs:** H.264 constrained-baseline video, no B-frames, and IDR frames only on PLI/FIR by default (`--keyint` changes this). Audio is Opus, 20 ms frames, 64 kbps.
 - **Signaling:** a single `POST /offer` without trickle ICE. Media uses one UDP port (default 50000).
+- **Rate control:** GCC by default. The page's Settings can switch a session to an open-loop sine wave instead. See [Rate control](#rate-control).
 - **Uplink test:** `/uplink.html` reverses the direction. The browser sends a generated video and a tone, and the server receives and measures them. See [Uplink test](#uplink-test).
 
 ## Running on a server (Docker)
@@ -90,7 +91,8 @@ Every flag can also be set as an environment variable: `--foo-bar` becomes `PUFF
   - Mean jitter buffer delay and RTT.
 
 ### Server (streamed to the page and logged)
-- **GCC:**
+- **Rate control** (`rateControl`): the algorithm and its current target bitrate. In sine mode it also has the wave parameters, the elapsed time, the phase (0–1 within the current cycle) and the number of TWCC/RTCP feedback packets received.
+- **GCC** (GCC sessions only):
   - Target bitrate.
   - Loss-based and delay-based targets, average loss.
   - Delay measurement, estimate and threshold.
@@ -124,6 +126,16 @@ Each session writes `logs/<UTC time>_<session>.jsonl`. Every line is `{"t": <ser
 The browser sends its stats over the DataChannel. Every 4th tick it sends the full report; on the other ticks it sends only the parts that change.
 
 The **Download JSON** button saves everything the client collected, including every rendered-frame record.
+
+## Rate control
+
+Under **Settings → Rate control** on the downlink page, choose either:
+- **GCC (default):** the normal send-side congestion control described above.
+- **Sine wave (no GCC):** the send rate is a fixed function of time, `rate(t) = center + amplitude · sin(2πt / period)`. t = 0 is when media starts, so the wave starts at the center and rises first. GCC does not run, and the rate ignores network feedback.
+
+The sine rate is the total send rate, just like a GCC target. It goes to Pion's leaky-bucket pacer (the same one GCC uses), and the encoder gets `headroom × rate − audio bitrate`. The session is still a normal WebRTC session: TWCC header extensions, TWCC feedback, NACK retransmissions, PLI/FIR keyframes and RTCP SR/RR all work as before, and the TWCC feedback is only counted. The server checks the parameters: amplitude must be less than the center, the period must be at least 1 s, and the peak (center + amplitude) can't exceed `--max-bitrate`.
+
+The choice is per session and goes in the `/offer` body, e.g. `"rateControl": {"algorithm": "sine", "centerKbps": 1000, "amplitudeKbps": 500, "periodSec": 10}`. It is recorded in the session's `meta` record, in `server-hello` and in each snapshot's `rateControl` section. Uplink sessions ignore it.
 
 ## Uplink test
 

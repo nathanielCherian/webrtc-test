@@ -136,6 +136,8 @@ func main() {
 		switch {
 		case errors.Is(err, session.ErrTooManySessions):
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		case errors.Is(err, session.ErrBadOffer):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case err != nil:
 			log.Printf("offer from %s: %v", clientAddr(r), err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})

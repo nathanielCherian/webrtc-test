@@ -64,6 +64,7 @@ button:disabled { opacity: .45; cursor: default; }
   margin-top: 6px;
   color: var(--muted);
 }
+.settings[open] > label[hidden] { display: none; }
 .settings input[type=number], .settings input[type=text], .settings select {
   display: block; width: 260px; margin-top: 2px; padding: 4px 6px;
   font: inherit; color: var(--text); background: var(--bg);
