@@ -30,6 +30,40 @@ Open TCP **8080** and UDP **50000** in the firewall, then browse to `http://<ser
 - **HTTPS:** a receive-only page works over plain http. For HTTPS, pass `--tls-cert` and `--tls-key`, or put the server behind a reverse proxy. Only `/offer` and the static files go through HTTP; media always goes to the UDP port directly.
 - **CPU cost:** each viewer uses one ffmpeg decode and one x264 encode, about one core at 720p30 with the `veryfast` preset. `--max-sessions` (default 8) sets the cap.
 
+## Watching from a machine that can only reach the server over SSH
+
+If the server is not reachable from your computer except through SSH (for example a lab machine with no public
+internet), WebRTC can still use UDP at both ends: `cmd/udptunnel` carries the UDP datagrams over an SSH port forward
+and keeps their boundaries. The browser does ordinary WebRTC over UDP to a relay on its own machine, and the server
+receives ordinary UDP from a relay next to it.
+
+```
+browser ──UDP──► udptunnel local ──TCP──► ssh -L ──TCP──► udptunnel remote ──UDP──► server :50000
+(your machine, 127.0.0.1:50000)                            (server, 127.0.0.1:50001)
+```
+
+```sh
+# on the server
+./bin/server --public-ip 127.0.0.1 ...            # ICE candidates point at the browser's local relay
+./bin/udptunnel remote -tcp 127.0.0.1:50001 -udp 127.0.0.1:50000
+
+# on your machine
+ssh -L 8080:localhost:8080 -L 50001:localhost:50001 <server>
+udptunnel local -udp 127.0.0.1:50000 -tcp 127.0.0.1:50001
+# then open http://localhost:8080
+```
+
+Build the local relay for your machine with `GOOS=darwin GOARCH=arm64 go build -o udptunnel ./cmd/udptunnel`
+(or `windows`/`linux`, `amd64`). The relays log packet counts every 10 s.
+
+The hop between the relays is TCP, so loss and delay on it are retransmitted and in order instead of real UDP loss.
+GCC and QoE numbers therefore reflect the SSH path, not a normal network path. It is fine for watching the stream and
+checking layer switches. To emulate network conditions, use `tc netem` on the server's loopback or Network Link
+Conditioner on your machine.
+
+`--udp-bind` binds the media port to one IP. With a loopback IP, loopback candidates are enabled, which is
+mainly useful for testing the tunnel on a single machine.
+
 ## Local development (macOS)
 
 ```sh
@@ -49,7 +83,8 @@ Every flag can also be set as an environment variable: `--foo-bar` becomes `PUFF
 | `--max-upload-mb` | 2048 | largest accepted upload |
 | `--http-addr` | `:8080` | |
 | `--udp-port` | `50000` | single UDP port for all media (0 = ephemeral) |
-| `--public-ip` | | IPs to advertise instead of the interface IPs (1:1 NAT) |
+| `--public-ip` | | IPs to advertise instead of the interface IPs (1:1 NAT; `127.0.0.1` for the SSH/UDP tunnel) |
+| `--udp-bind` | all interfaces | IP address the media port binds to |
 | `--stun` | | STUN URL(s), comma-separated |
 | `--start-bitrate` / `--min-bitrate` / `--max-bitrate` | 1M / 100k / 6M | GCC limits (bps) |
 | `--audio-bitrate` | 64000 | Opus bitrate |

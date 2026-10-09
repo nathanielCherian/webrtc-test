@@ -46,6 +46,7 @@ func main() {
 		maxUploadMB   = flag.Int64("max-upload-mb", 2048, "largest accepted upload (MB)")
 		publicIP      = flag.String("public-ip", "", "public IP(s) to advertise in ICE host candidates, comma-separated (for cloud VMs behind 1:1 NAT)")
 		udpPort       = flag.Int("udp-port", 50000, "single UDP port for all WebRTC media (0 = ephemeral ports)")
+		udpBind       = flag.String("udp-bind", "", "IP address to bind the media port to (default: all interfaces)")
 		stunURLs      = flag.String("stun", "", "STUN server URL(s), comma-separated, e.g. stun:stun.l.google.com:19302")
 		ipv6          = flag.Bool("ipv6", false, "also gather IPv6 candidates")
 		startBitrate  = flag.Int("start-bitrate", 1_000_000, "GCC initial bitrate (bps)")
@@ -94,7 +95,11 @@ func main() {
 		if *ipv6 {
 			network = "udp"
 		}
-		conn, err := net.ListenUDP(network, &net.UDPAddr{Port: *udpPort})
+		bindIP := net.ParseIP(*udpBind)
+		if bindIP != nil && bindIP.IsLoopback() {
+			se.SetIncludeLoopbackCandidate(true) // otherwise ICE skips a loopback-bound mux
+		}
+		conn, err := net.ListenUDP(network, &net.UDPAddr{IP: bindIP, Port: *udpPort})
 		if err != nil {
 			log.Fatalf("listen udp %d: %v", *udpPort, err)
 		}
