@@ -103,6 +103,9 @@ var (
 )
 
 func probeWithFFmpeg(ctx context.Context, path string) (*MediaInfo, error) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return nil, errors.New("neither ffprobe nor ffmpeg is on PATH (the server needs ffmpeg to decode and to encode audio)")
+	}
 	// ffmpeg exits non-zero without an output file; the stream summary is on stderr.
 	out, _ := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-i", path).CombinedOutput()
 	text := string(out)
