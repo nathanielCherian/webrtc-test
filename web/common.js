@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 // ---------------------------------------------------------------------------
 // Small canvas time-series chart (no dependencies).
 // ---------------------------------------------------------------------------
-const PALETTE = ['#2f6fdb', '#e8703a', '#1f9e74', '#b04fc9', '#d4a21a', '#6b6b70'];
+const PALETTE = ['#2f6fdb', '#e8703a', '#1f9e74', '#b04fc9', '#d4a21a', '#6b6b70', '#d6336c'];
 
 class Chart {
   constructor(canvas, series, { windowSec = 90 } = {}) {
@@ -26,22 +26,38 @@ class Chart {
   draw(now) {
     const c = this.canvas;
     const dpr = window.devicePixelRatio || 1;
-    const w = c.clientWidth, h = c.clientHeight;
-    if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+    const w = c.clientWidth;
+    const L = 44, R = 8, B = 18;
+    // Lay the legend out first, wrapping to as many rows as the width needs; the
+    // canvas grows by the extra rows so the plot area keeps its height.
     const ctx = c.getContext('2d');
+    const font = '11px system-ui, sans-serif', rowH = 14;
+    ctx.font = font;
+    let lx = L, row = 0;
+    const legend = this.series.map((s) => {
+      const lw = 14 + ctx.measureText(s.name).width;
+      if (lx > L && lx + lw > w - R) { lx = L; row++; }
+      const pos = { x: lx, y: 9 + row * rowH };
+      lx += lw + 14;
+      return pos;
+    });
+    const T = 22 + row * rowH;
+    const height = `${180 + row * rowH}px`;
+    if (c.style.height !== height) c.style.height = height;
+    const h = c.clientHeight;
+    if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     const css = getComputedStyle(document.documentElement);
     const grid = css.getPropertyValue('--grid').trim();
     const muted = css.getPropertyValue('--muted').trim();
-    const L = 44, R = 8, T = 22, B = 18;
     const t1 = now, t0 = now - this.windowSec * 1000;
     let max = 0;
     for (const s of this.series) for (const [, v] of s.pts) max = Math.max(max, v);
     max = niceMax(max || 1);
     const x = (t) => L + (t - t0) / (t1 - t0) * (w - L - R);
     const y = (v) => T + (1 - v / max) * (h - T - B);
-    ctx.font = '11px system-ui, sans-serif';
+    ctx.font = font; // resizing the canvas resets the context
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const v = max * i / 4, yy = y(v);
@@ -51,17 +67,16 @@ class Chart {
     }
     ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
     ctx.fillText(`last ${this.windowSec}s`, L, h - 4);
-    let lx = L;
-    for (const s of this.series) {
-      ctx.fillStyle = s.color; ctx.fillRect(lx, 7, 10, 3);
+    this.series.forEach((s, i) => {
+      const { x: lx, y: ly } = legend[i];
+      ctx.fillStyle = s.color; ctx.fillRect(lx, ly - 2, 10, 3);
       ctx.fillStyle = muted; ctx.textBaseline = 'middle';
-      const label = s.name; ctx.fillText(label, lx + 14, 9);
-      lx += 14 + ctx.measureText(label).width + 14;
-      if (s.pts.length < 2) continue;
+      ctx.fillText(s.name, lx + 14, ly);
+      if (s.pts.length < 2) return;
       ctx.strokeStyle = s.color; ctx.lineWidth = 1.75; ctx.beginPath();
       s.pts.forEach(([t, v], i) => (i ? ctx.lineTo(x(t), y(v)) : ctx.moveTo(x(t), y(v))));
       ctx.stroke();
-    }
+    });
   }
 }
 

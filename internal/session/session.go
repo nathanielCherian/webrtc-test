@@ -92,6 +92,9 @@ type OfferRequest struct {
 	Source string `json:"source,omitempty"`
 	// RateControl picks the downlink bandwidth estimator; nil means GCC.
 	RateControl *RateControlRequest `json:"rateControl,omitempty"`
+	// Padding is "" (or "probe"): pad only to probe for the next simulcast layer; or
+	// "fill": pad up to the whole GCC target. Simulcast sessions with GCC only.
+	Padding string `json:"padding,omitempty"`
 }
 
 // RateControlRequest selects and parameterises the downlink rate control.
@@ -108,6 +111,12 @@ const (
 	RateControlGCC    = "gcc"
 	RateControlSine   = ratecontrol.ShapeSine
 	RateControlSquare = ratecontrol.ShapeSquare
+)
+
+// Padding modes of simulcast sessions.
+const (
+	PaddingProbe = "probe"
+	PaddingFill  = "fill"
 )
 
 // ModeUplink is OfferRequest.Mode for sessions where the browser sends media.
@@ -200,6 +209,16 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 			return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
 		}
 		sim = newSimState(m.hub)
+		switch req.Padding {
+		case "", PaddingProbe:
+		case PaddingFill:
+			if rc != RateControlGCC {
+				return nil, fmt.Errorf("%w: padding %q needs GCC rate control", ErrBadOffer, req.Padding)
+			}
+			sim.fill = true
+		default:
+			return nil, fmt.Errorf("%w: unknown padding %q", ErrBadOffer, req.Padding)
+		}
 	case req.Source == "" || req.Source == "file":
 		if info, err = m.lib.Get(ctx, req.Video); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrBadOffer, err)
@@ -287,6 +306,9 @@ func (s *Session) rateControlInfo() map[string]any {
 		return nil
 	}
 	info := map[string]any{"algorithm": s.rc}
+	if s.sim != nil && s.rc == RateControlGCC {
+		info["padding"] = s.sim.paddingMode()
+	}
 	if s.wave != nil {
 		info["centerBps"] = s.wave.CenterBps
 		info["amplitudeBps"] = s.wave.AmplitudeBps

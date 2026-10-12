@@ -58,6 +58,7 @@ func main() {
 		center    = flag.Float64("center", 1500, "wave center (kbps)")
 		amp       = flag.Float64("amp", 1000, "wave amplitude (kbps)")
 		period    = flag.Float64("period", 20, "wave period (s)")
+		padding   = flag.String("padding", "", `simulcast padding with gcc: "probe" (default) or "fill" (pad up to the GCC target)`)
 		record    = flag.String("record", "", "write client 0's received H.264 (Annex-B) to this file")
 		every     = flag.Duration("report", 2*time.Second, "report interval")
 		advertise = flag.String("advertise-ip", "", "advertise only this IP in the client's ICE candidates (e.g. 192.0.2.1 to act like a client the server can't reach directly)")
@@ -83,7 +84,7 @@ func main() {
 			c.recorder = w
 			defer w.Close()
 		}
-		if err := c.connect(ctx, *server, *source, rcReq, *advertise); err != nil {
+		if err := c.connect(ctx, *server, *source, rcReq, *padding, *advertise); err != nil {
 			log.Fatalf("client %d: %v", i, err)
 		}
 		defer c.pc.Close()
@@ -146,7 +147,7 @@ func summary(clients []*client, d time.Duration) {
 	}
 }
 
-func (c *client) connect(ctx context.Context, server, source string, rc map[string]any, advertise string) error {
+func (c *client) connect(ctx context.Context, server, source string, rc map[string]any, padding, advertise string) error {
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterDefaultCodecs(); err != nil {
 		return err
@@ -198,7 +199,7 @@ func (c *client) connect(ctx context.Context, server, source string, rc map[stri
 	}
 	<-gathered
 	body, _ := json.Marshal(map[string]any{
-		"sdp": pc.LocalDescription().SDP, "type": "offer", "source": source, "rateControl": rc,
+		"sdp": pc.LocalDescription().SDP, "type": "offer", "source": source, "rateControl": rc, "padding": padding,
 		"client": map[string]any{"userAgent": "simclient", "index": c.id},
 	})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(server, "/")+"/offer", bytes.NewReader(body))

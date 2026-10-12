@@ -30,7 +30,8 @@ const charts = {
     { key: 'ccTarget', name: 'server CC target' },
     { key: 'encOut', name: 'server encoder out' },
     { key: 'encCfg', name: 'encoder configured / simulcast layer' },
-    { key: 'pad', name: 'server probe padding' },
+    { key: 'pad', name: 'server padding' },
+    { key: 'sendTotal', name: 'server total send (video + audio + padding)' },
     { key: 'availIn', name: 'client avail. incoming' },
   ]),
   rtt: new Chart($('c-rtt'), [
@@ -102,7 +103,7 @@ $('stop').onclick = () => stop('user stop');
 $('download').onclick = download;
 
 // Settings that apply to the next session and are locked while one runs.
-const sessionInputs = ['video-pick', 'rcAlgo', 'waveCenter', 'waveAmp', 'wavePeriod', 'waveDuty'];
+const sessionInputs = ['video-pick', 'rcAlgo', 'padMode', 'waveCenter', 'waveAmp', 'wavePeriod', 'waveDuty'];
 
 // ---------------------------------------------------------------------------
 // Video library: pick a server-side file, or upload one.
@@ -145,6 +146,7 @@ async function loadVideos(select) {
   }
   pick.replaceChildren(...options);
   if ([...pick.options].some((o) => o.value === keep)) pick.value = keep;
+  updateRateControlUI();
   $('upload-row').hidden = !list.allowUpload;
   S.maxUploadMB = list.maxUploadMB;
 }
@@ -183,13 +185,17 @@ $('upload-btn').onclick = () => {
 };
 loadVideos();
 
-// Rate control settings: the wave inputs only apply to the sine/square algorithms.
+// Rate control settings: the wave inputs only apply to the sine/square algorithms,
+// the padding mode only to the simulcast source with GCC.
+function paddingApplies() { return $('video-pick').value === SIMULCAST && $('rcAlgo').value === 'gcc'; }
 function updateRateControlUI() {
   const algo = $('rcAlgo').value;
+  for (const el of document.querySelectorAll('.pad-opt')) el.hidden = !paddingApplies();
   for (const el of document.querySelectorAll('.wave-opt')) el.hidden = algo === 'gcc';
   for (const el of document.querySelectorAll('.square-opt')) el.hidden = algo !== 'square';
 }
 $('rcAlgo').onchange = updateRateControlUI;
+$('video-pick').addEventListener('change', updateRateControlUI);
 updateRateControlUI();
 
 function rateControlRequest() {
@@ -291,6 +297,7 @@ async function start() {
         sdp: pc.localDescription.sdp, type: pc.localDescription.type, client: clientInfo(),
         ...($('video-pick').value === SIMULCAST ? { source: 'simulcast' } : { video: $('video-pick').value || undefined }),
         rateControl: rateControlRequest(),
+        padding: paddingApplies() ? $('padMode').value : undefined,
       }),
     });
     const body = await res.json();
@@ -634,7 +641,7 @@ function onServerMessage(data) {
       const g = msg.gcc || {}, rc = msg.rateControl || {}, e = msg.encoder || {}, v = (msg.interceptorStats || {}).video || {};
       const ccTarget = rc.targetBitrate !== undefined ? rc.targetBitrate : g.targetBitrate;
       const sim = msg.simulcast;
-      charts.bitrate.push(recvT, { ccTarget: ccTarget / 1000, encOut: e.outputBitrate / 1000, encCfg: e.configuredBitrate / 1000, pad: sim ? sim.paddingBps / 1000 : undefined });
+      charts.bitrate.push(recvT, { ccTarget: ccTarget / 1000, encOut: e.outputBitrate / 1000, encCfg: e.configuredBitrate / 1000, pad: sim ? sim.paddingBps / 1000 : undefined, sendTotal: sim ? sim.sentTotalBps / 1000 : undefined });
       const rrRtt = ((msg.rtcp || {}).video || {}).rttMs;
       charts.rtt.push(recvT, { serverRtt: v.rttMs > 0 ? v.rttMs : rrRtt });
       charts.fps.push(recvT, { encoded: e.outputFps });
@@ -652,7 +659,7 @@ function describeRateControl(rc) {
   const c = rc.centerBps / 1000, a = rc.amplitudeBps / 1000;
   if (rc.algorithm === 'sine') return `sine ${c} ± ${a} kbps, period ${rc.periodSec} s`;
   if (rc.algorithm === 'square') return `square ${c + a} / ${c - a} kbps, period ${rc.periodSec} s, ${Math.round(rc.duty * 100)}% high`;
-  return rc.algorithm;
+  return rc.padding === 'fill' ? `${rc.algorithm}, padding fills the target` : rc.algorithm;
 }
 
 function sendToServer(obj) { sendOnChannel(S.dc, obj); }

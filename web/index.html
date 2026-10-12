@@ -28,6 +28,9 @@
       <label>Rate control
         <select id="rcAlgo"><option value="gcc" selected>GCC (default)</option><option value="sine">Sine wave (no GCC)</option><option value="square">Square wave (no GCC)</option></select>
       </label>
+      <label class="pad-opt" hidden>Simulcast padding
+        <select id="padMode"><option value="probe" selected>Probe for the next layer (default)</option><option value="fill">Fill up to the GCC target</option></select>
+      </label>
       <label class="wave-opt" hidden>Center rate (kbps, total send) <input id="waveCenter" type="number" value="1000" min="1" step="50"></label>
       <label class="wave-opt" hidden>Amplitude (kbps, &lt; center; square: high = center + amp, low = center − amp) <input id="waveAmp" type="number" value="500" min="0" step="50"></label>
       <label class="wave-opt" hidden>Period (s, ≥ 1) <input id="wavePeriod" type="number" value="10" min="1" step="1"></label>

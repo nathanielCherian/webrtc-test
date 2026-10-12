@@ -24,7 +24,8 @@ import (
 // still has its own PeerConnection and rate control (GCC or a wave); the rate
 // control picks which rendition to forward, switching on the renditions'
 // time-aligned IDRs, and pads with probe packets so GCC can discover that a
-// higher rendition fits.
+// higher rendition fits (or, with OfferRequest.Padding "fill", so the send rate
+// always matches the GCC target).
 
 // SourceSimulcast is OfferRequest.Source for the shared simulcast renditions.
 const SourceSimulcast = "simulcast"
@@ -72,6 +73,7 @@ type simState struct {
 	sub    *simulcast.Subscriber
 	layers []simulcast.LayerConfig
 	sel    *simulcast.Selector
+	fill   bool // pad up to the whole GCC target instead of only probing
 
 	mu          sync.Mutex // guards everything below (read by snapshots)
 	cur         int        // layer being forwarded, -1 before the first keyframe
@@ -82,7 +84,9 @@ type simState struct {
 	switches    int64
 	keyWaits    int64 // PLI/FIR or overflow that made us wait for a keyframe
 	waitFrames  int64 // frames of the current layer skipped while waiting
-	padBps      int
+	padBps      int   // probe mode: rate to pad at; fill mode: measured padding rate
+	fillBps     int   // fill mode: total send rate that media plus padding should reach
+	padSent     rateMeter
 	padBytes    int64
 	padPackets  int64
 	probeHold   time.Time
@@ -107,6 +111,13 @@ func (st *simState) name(i int) string {
 		return "none"
 	}
 	return st.layers[i].Name
+}
+
+func (st *simState) paddingMode() string {
+	if st.fill {
+		return PaddingFill
+	}
+	return PaddingProbe
 }
 
 // simulcastLayers lists the renditions for hello/meta (nil for other sessions).
@@ -243,10 +254,17 @@ func (s *Session) simDecide(now time.Time) {
 		st.pending = -1
 	}
 
-	// Pad up to (just under) the estimate while a higher layer exists, so GCC can
-	// grow beyond 1.5x what we send. Only for GCC: a wave's target is open-loop.
-	st.padBps = 0
-	if s.rc == RateControlGCC && st.cur > 0 && (st.pending < 0 || st.pending < st.cur) && now.After(st.probeHold) {
+	// Only GCC pads: a wave's target is open-loop.
+	st.padBps, st.fillBps = 0, 0
+	switch {
+	case s.rc != RateControlGCC:
+	case st.fill:
+		// Fill mode: forwarder.padding sends whatever the media leaves of the target.
+		st.fillBps = target
+		st.padBps = int(st.padSent.rate(now))
+	case st.cur > 0 && (st.pending < 0 || st.pending < st.cur) && now.After(st.probeHold):
+		// Pad up to (just under) the estimate while a higher layer exists, so GCC can
+		// grow beyond 1.5x what we send.
 		next := float64(st.layers[st.cur-1].BitrateBps) * st.sel.UpMargin
 		need := (next + float64(s.cfg.AudioBitrate)) / s.cfg.Headroom * 1.05
 		goal := math.Min(0.95*float64(target), need)
@@ -270,6 +288,7 @@ type forwarder struct {
 	lastDelta int64
 	started   bool
 	padCredit float64
+	fillDebt  float64 // fill mode: video bytes sent that padding has not yet made room for
 }
 
 func (fw *forwarder) frame(f *simulcast.Frame) error {
@@ -343,20 +362,34 @@ func (fw *forwarder) frame(f *simulcast.Frame) error {
 		}
 	}
 	s.encStats.Frame(f.Bytes, f.Key, false, 0, time.Since(t0))
+	fw.fillDebt += float64(f.Bytes)
 	return nil
 }
 
-// padding sends probe packets at the rate simDecide chose.
+// padding sends probe packets: at the rate simDecide chose, or in fill mode
+// whatever the target allowed since the last tick and the media did not use.
 func (fw *forwarder) padding(dt time.Duration) error {
 	st := fw.s.sim
 	st.mu.Lock()
-	rate := st.padBps
+	rate, fill := st.padBps, st.fillBps
 	st.mu.Unlock()
-	if rate <= 0 || !fw.started {
-		fw.padCredit = 0
+	switch {
+	case !fw.started || (fill <= 0 && rate <= 0):
+		fw.padCredit, fw.fillDebt = 0, 0
 		return nil
+	case fill > 0:
+		// Token bucket: each tick earns the target's bytes less audio, and video
+		// frames are paid for first. A large frame leaves a debt (at most 1 s of
+		// the target) that pauses padding until the average is back on target.
+		earned := float64(fill-fw.s.cfg.AudioBitrate) * math.Min(dt.Seconds(), 0.1) / 8
+		fw.fillDebt = math.Min(fw.fillDebt-earned, float64(fill)/8)
+		if fw.fillDebt < 0 {
+			fw.padCredit -= fw.fillDebt
+			fw.fillDebt = 0
+		}
+	default:
+		fw.padCredit = math.Min(fw.padCredit+float64(rate)*dt.Seconds()/8, 8*ratecontrol.MaxProbeBytes)
 	}
-	fw.padCredit = math.Min(fw.padCredit+float64(rate)*dt.Seconds()/8, 8*ratecontrol.MaxProbeBytes)
 	var n, bytes int64
 	for fw.padCredit >= ratecontrol.MaxProbeBytes {
 		pkt := &rtp.Packet{Header: rtp.Header{Version: 2, SequenceNumber: fw.seq.NextSequenceNumber(), Timestamp: fw.ts},
@@ -371,6 +404,7 @@ func (fw *forwarder) padding(dt time.Duration) error {
 	st.mu.Lock()
 	st.padPackets += n
 	st.padBytes += bytes
+	st.padSent.add(time.Now(), int(bytes))
 	st.mu.Unlock()
 	return nil
 }
@@ -380,12 +414,16 @@ func (s *Session) simSnapshot() map[string]any {
 	st := s.sim
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	now := time.Now()
+	sentVideo := st.sentBytes.rate(now)
 	out := map[string]any{
 		"layer": st.name(st.cur), "pending": nil, "budgetBps": st.budget, "targetBps": st.target,
 		"switches": st.switches, "keyframeWaits": st.keyWaits, "framesSkippedWaitingForKey": st.waitFrames,
-		"paddingBps": st.padBps, "paddingBytes": st.padBytes, "paddingPackets": st.padPackets,
+		"paddingMode": st.paddingMode(), "paddingBps": st.padBps, "paddingBytes": st.padBytes, "paddingPackets": st.padPackets,
 		"probeHoldMs":  math.Max(0, float64(time.Until(st.probeHold).Milliseconds())),
-		"sentVideoBps": st.sentBytes.rate(time.Now()),
+		"sentVideoBps": sentVideo,
+		// Everything sent: video, audio (nominal) and the padding actually written.
+		"sentTotalBps": sentVideo + float64(s.cfg.AudioBitrate) + st.padSent.rate(now),
 	}
 	if st.pending >= 0 {
 		out["pending"] = st.name(st.pending)

@@ -246,6 +246,7 @@ transcoder ─┬─ high 2500k :5001 ─┐               │
   - **When:** a switch happens at the target layer's next IDR. This relies on the renditions having IDRs at the same timestamps (the sfu-test transcoder guarantees this). All layers share one 90 kHz clock, so the RTP timestamps stay continuous across a switch.
   - **Packetisation:** each viewer packetises the frames itself on a `TrackLocalStaticRTP`, so the sequence numbers and timestamps are its own.
 - **Probing:** Pion's GCC never raises its estimate above 1.5× the rate it sees acknowledged, so a viewer sending a fixed-rate low layer would never discover that a higher layer fits. As libwebrtc does, a GCC viewer below the top layer pads its send rate up to its estimate (at most what the next layer needs). The padding is sent as RTP padding-only packets, which browsers discard. Pion's GCC only counts payload bytes, so probes go through GCC as zero-filled payloads and become padding just before SRTP (`ratecontrol.PaddingProbes`). Padding pauses for 3 s after GCC lowers its target. Wave modes never pad, because their target is open-loop.
+- **Fill padding (optional):** with `"padding": "fill"` a GCC viewer instead pads all the way up to the GCC target, on every layer including the top one, so the send rate (video + audio + padding) matches the target the way a sender with a full encoder would. It is a token bucket: every 10 ms the viewer earns the target's bytes, pays for the video and audio it sent, and sends the rest as padding. A large frame leaves a debt that pauses padding until the average is back on target. There is no pause after GCC lowers its target; the padding simply follows the new target.
 - **Keyframes:** the encoder is shared, so a viewer's PLI/FIR can't force an IDR. The viewer instead stops sending until the next periodic IDR of its layer, and the event is counted as `keyframeWaits`. The GOP length of the renditions therefore bounds three things: startup time, how quickly a down-switch takes effect, and recovery after a PLI. With 2 s GOPs, a down-switch can keep sending the old layer for up to 2 s.
 
 ### Running it
@@ -261,7 +262,8 @@ transcoder ─┬─ high 2500k :5001 ─┐               │
 
 On the page, **Settings → Video** lists "Live simulcast (shared encoder)" first and selects it by default. The bitrate chart then shows:
 - the forwarded layer's nominal bitrate (under "encoder configured / simulcast layer"),
-- the probe padding,
+- the padding,
+- the total send rate (video + audio + padding), which in fill mode tracks the CC target,
 - the client's received rate.
 
 Layer switches appear in **Events**. The server table has a `simulcast` section with:
@@ -271,7 +273,9 @@ Layer switches appear in **Events**. The server table has a `simulcast` section 
 
 The `media` section shows the hub's per-layer status: measured bitrate, resolution, fps, keyframes and TS continuity errors.
 
-The API is `"source": "simulcast"` in the `/offer` body. `GET /info` and `GET /videos` include the hub status under `simulcast`.
+**Settings → Simulcast padding** (shown for the simulcast source with GCC) switches between probing for the next layer and filling up to the GCC target. The `simulcast` section reports the mode as `paddingMode`; in fill mode `paddingBps` is the measured padding rate.
+
+The API is `"source": "simulcast"` in the `/offer` body, plus `"padding": "fill"` for fill padding. `GET /info` and `GET /videos` include the hub status under `simulcast`.
 
 The UDP ports are bound by this server. Anything else that reads them, such as sfu-test's `tools/relay.sh`, must use different ports. The renditions are 720p60 at level 3.2, while the SDP signals level 3.1 (`42e01f`). Browsers decode them anyway; strict decoders may not.
 
@@ -286,6 +290,7 @@ It can also record viewer 0's H.264.
 ```sh
 go build -o bin/simclient ./cmd/simclient
 ./bin/simclient -n 3 -duration 60s                                     # 3 GCC viewers
+./bin/simclient -padding fill -duration 60s                            # pad up to the GCC target
 ./bin/simclient -rc square -center 1500 -amp 1200 -period 16           # force layer switches
 ./bin/simclient -record c0.h264 && ffprobe -show_frames c0.h264        # check the forwarded stream decodes
 ```
