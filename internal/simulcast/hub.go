@@ -123,7 +123,9 @@ type Hub struct {
 	subs map[*Subscriber]struct{}
 
 	audioIn       chan []byte
+	audioOut      chan audioPage // transcoded pages waiting for paceAudio
 	audioPages    atomic.Int64
+	audioDropped  atomic.Int64 // pages dropped because the pacer's backlog was full
 	audioRestarts atomic.Int64
 	audioLive     atomic.Bool
 }
@@ -152,7 +154,8 @@ type layer struct {
 
 // NewHub creates a hub; call Run to start ingest.
 func NewHub(layers []LayerConfig, opt Options) *Hub {
-	h := &Hub{opt: opt, subs: map[*Subscriber]struct{}{}, audioIn: make(chan []byte, 256)}
+	h := &Hub{opt: opt, subs: map[*Subscriber]struct{}{}, audioIn: make(chan []byte, 256),
+		audioOut: make(chan audioPage, audioBacklogPages)}
 	if opt.FFmpeg == "" {
 		h.opt.FFmpeg = "ffmpeg"
 	}
@@ -226,6 +229,7 @@ func (h *Hub) Run(ctx context.Context) error {
 	}()
 	if h.opt.AudioLayer >= 0 {
 		go h.audioLoop(ctx)
+		go h.paceAudio(ctx)
 	}
 	var wg sync.WaitGroup
 	for i, l := range h.layers {
@@ -376,6 +380,8 @@ func (h *Hub) Snapshot() map[string]any {
 		"audioLive":     h.audioLive.Load(),
 		"audioPages":    h.audioPages.Load(),
 		"audioRestarts": h.audioRestarts.Load(),
+		"audioDropped":  h.audioDropped.Load(),
+		"audioBacklog":  len(h.audioOut),
 	}
 }
 
@@ -490,6 +496,7 @@ func (h *Hub) readOpus(r io.Reader) error {
 		return fmt.Errorf("ogg header: %w", err)
 	}
 	var lastGranule uint64
+	var media time.Duration // position of this page in the transcoder's output
 	for {
 		page, hdr, err := ogg.ParseNextPage()
 		if err != nil {
@@ -508,7 +515,85 @@ func (h *Hub) readOpus(r io.Reader) error {
 		lastGranule = hdr.GranulePosition
 		h.audioPages.Add(1)
 		h.audioLive.Store(true)
-		a := &AudioSample{Data: page, Duration: dur}
+		select {
+		case h.audioOut <- audioPage{a: &AudioSample{Data: page, Duration: dur}, arrival: time.Now(), media: media}:
+		default:
+			h.audioDropped.Add(1)
+		}
+		media += dur
+	}
+}
+
+// audioPage is a transcoded page with the time it came out of ffmpeg and its
+// position in ffmpeg's output (0 at each transcoder start).
+type audioPage struct {
+	a       *AudioSample
+	arrival time.Time
+	media   time.Duration
+}
+
+const (
+	audioBacklogPages = 64 // ~1.3 s of 20 ms pages
+	// audioPaceWindow is how long a page's arrival keeps setting the schedule.
+	audioPaceWindow = 2 * time.Second
+	// audioLateJump: a page this much later than the schedule is a stall, not a
+	// burst. It goes out at once and does not move the schedule.
+	audioLateJump = 100 * time.Millisecond
+)
+
+// paceAudio sends the Opus pages to subscribers at the rate of their timestamps.
+// The transcoder emits them in bursts (ffmpeg encodes AAC as soon as it arrives).
+// Forwarded as they come, pages arrive far from their RTP timestamps, the browser's
+// audio jitter buffer grows to absorb them, and lip sync then raises the video
+// jitter buffer to match.
+//
+// Each page's offset is its arrival time minus its media position. A page is due
+// at its media position plus the largest offset of the last audioPaceWindow, which
+// is the schedule of the first page of each burst, so the rest of a burst waits
+// for its slot. After a stall, the late pages and the catch-up burst go out on
+// arrival without moving the schedule, so the stall leaves nothing queued.
+func (h *Hub) paceAudio(ctx context.Context) {
+	type sample struct {
+		arrival time.Time
+		offset  time.Duration
+	}
+	var window []sample // offsets in decreasing order, so window[0] is the maximum
+	epoch := time.Now() // offsets are measured from here
+	lastMedia := time.Duration(-1)
+	timer := time.NewTimer(0)
+	<-timer.C
+	for {
+		var p audioPage
+		select {
+		case <-ctx.Done():
+			return
+		case p = <-h.audioOut:
+		}
+		if p.media <= lastMedia { // the transcoder restarted: new timeline
+			window = window[:0]
+		}
+		lastMedia = p.media
+		offset := p.arrival.Sub(epoch) - p.media
+		for len(window) > 0 && p.arrival.Sub(window[0].arrival) > audioPaceWindow {
+			window = window[1:]
+		}
+		if len(window) == 0 || offset <= window[0].offset+audioLateJump {
+			for len(window) > 0 && window[len(window)-1].offset <= offset {
+				window = window[:len(window)-1]
+			}
+			window = append(window, sample{p.arrival, offset})
+		}
+		due := epoch.Add(window[0].offset + p.media)
+		if d := time.Until(due); d > 0 {
+			timer.Reset(d)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		a := p.a
 		h.mu.RLock()
 		for s := range h.subs {
 			select {
