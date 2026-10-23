@@ -602,6 +602,7 @@ function renderQoE() {
     ['Render stalls', s.renderStalls, `${fmtNum(s.renderStallMs / 1000)} s`],
     ['Stall ratio', s.renderStallRatio !== undefined ? 100 * s.renderStallRatio : undefined, '%'],
     ['Packet loss', s.lossPct, '%'],
+    ['Packets lost', s.packetsLost, ''],
     nackTile(),
     ['Frames dropped', s.framesDropped, ''],
     ['Audio concealed', s.audioConcealedPct, '%'],
