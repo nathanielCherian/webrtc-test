@@ -151,6 +151,7 @@ type Session struct {
 	audioSSRC   uint32
 	rtcpVideo   *telemetry.RTCPCounters
 	rtcpAudio   *telemetry.RTCPCounters
+	retransmits *telemetry.Retransmits // packets the NACK responder resent (downlink)
 
 	sim      *simState                   // set for simulcast sessions
 	videoRTP *webrtc.TrackLocalStaticRTP // simulcast video (packetized by the session)
@@ -341,6 +342,11 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 	statsFactory.OnNewPeerConnection(func(_ string, g stats.Getter) { getterCh <- g })
 	// Before NACK/reports so it sees retransmissions and outgoing SRs (needed for RTT).
 	ir.Add(statsFactory)
+	if s.mode != ModeUplink {
+		// Between the NACK responder and stats, so it sees the resends.
+		s.retransmits = telemetry.NewRetransmits()
+		ir.Add(s.retransmits)
+	}
 	if err := webrtc.ConfigureNack(me, ir); err != nil {
 		return err
 	}
@@ -784,6 +790,7 @@ func (s *Session) downlinkSnapshot(snap map[string]any) {
 	snap["encoder"] = enc
 	snap["media"] = mediaInfo
 	snap["rtcp"] = map[string]any{"video": s.rtcpVideo.Snapshot(), "audio": s.rtcpAudio.Snapshot()}
+	snap["retransmits"] = map[string]any{"video": s.retransmits.Snapshot(s.videoSSRC)}
 	snap["interceptorStats"] = map[string]any{
 		"video": s.interceptorStats(s.videoSSRC),
 		"audio": s.interceptorStats(s.audioSSRC),

@@ -602,6 +602,7 @@ function renderQoE() {
     ['Render stalls', s.renderStalls, `${fmtNum(s.renderStallMs / 1000)} s`],
     ['Stall ratio', s.renderStallRatio !== undefined ? 100 * s.renderStallRatio : undefined, '%'],
     ['Packet loss', s.lossPct, '%'],
+    nackTile(),
     ['Frames dropped', s.framesDropped, ''],
     ['Audio concealed', s.audioConcealedPct, '%'],
     ['Avg video', s.avgVideoKbps, 'kbps'],
@@ -611,6 +612,15 @@ function renderQoE() {
 }
 
 function lastServer() { return S.serverSnaps[S.serverSnaps.length - 1]; }
+
+// Sequence numbers the viewer NACKed (as received by the server) and how many
+// of those packets the server actually resent.
+function nackTile() {
+  const srv = lastServer();
+  const nacked = srv?.rtcp?.video?.nackedSeqs;
+  const resent = srv?.retransmits?.video?.packets;
+  return ['NACKed packets', nacked, resent !== undefined ? `${fmtNum(resent)} resent` : ''];
+}
 
 function renderTables(d, vin, ain, extra) {
   $('t-derived').innerHTML = kvHTML(d);
@@ -647,7 +657,7 @@ function onServerMessage(data) {
       charts.fps.push(recvT, { encoded: e.outputFps });
       charts.loss.push(recvT, { serverLoss: v.fractionLost !== undefined ? 100 * v.fractionLost : undefined, gccLoss: g.averageLoss !== undefined ? 100 * g.averageLoss : undefined });
       charts.delay.push(recvT, { gccDelay: g.delayEstimate });
-      const view = { rateControl: msg.rateControl, simulcast: sim, gcc: msg.gcc, encoder: e, media: msg.media, rtcp: msg.rtcp, rtp: { video: v.outbound, audio: ((msg.interceptorStats || {}).audio || {}).outbound }, state: msg.state, selectedCandidatePair: msg.selectedCandidatePair };
+      const view = { rateControl: msg.rateControl, simulcast: sim, gcc: msg.gcc, encoder: e, media: msg.media, rtcp: msg.rtcp, retransmits: msg.retransmits, rtp: { video: v.outbound, audio: ((msg.interceptorStats || {}).audio || {}).outbound }, state: msg.state, selectedCandidatePair: msg.selectedCandidatePair };
       $('t-server').innerHTML = kvHTML(view);
       $('t-server-raw').textContent = JSON.stringify(msg, null, 2);
       break;

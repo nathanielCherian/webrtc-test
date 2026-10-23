@@ -150,6 +150,7 @@ Every flag can also be set as an environment variable: `--foo-bar` becomes `PUFF
   - TWCC feedback count.
   - REMB.
   - The last receiver report (fraction lost, total lost, jitter), and RTT computed from LSR/DLSR.
+- **Retransmits** (`retransmits.video`): packets and bytes the NACK responder actually resent. `nackedSeqs` counts every request, so a packet NACKed twice counts twice. A NACKed packet that has already left the 1024-packet buffer is not resent. The page's "NACKed packets" tile shows both.
 - **Pion stats interceptor:** outbound packets and bytes, plus remote-inbound data (loss, jitter, RTT).
 - **Full Pion `GetStats()`:** candidate pairs, transports and the data channel.
 - **Other:**
