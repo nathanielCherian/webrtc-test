@@ -111,14 +111,18 @@ $('download').onclick = download;
 // Settings that apply to the next session and are locked while one runs.
 const sessionInputs = ['video-pick', 'rcAlgo', 'padMode', 'waveCenter', 'waveAmp', 'wavePeriod', 'waveDuty', 'owdUrl', 'owdInterval', 'owdSize', 'owdHash'];
 
-// The one-way delay server defaults to owdserver on this host; whatever the
-// viewer types is remembered (it may run elsewhere).
+// The one-way delay server defaults to the media server's --owd-url (set from
+// /videos), else owdserver on this host; whatever the viewer types is remembered.
 for (const id of ['owdUrl', 'owdInterval', 'owdSize', 'owdHash']) {
   let saved = null;
   try { saved = localStorage.getItem(id); } catch { /* storage unavailable */ }
   if (saved !== null) $(id).value = saved;
   else if (id === 'owdUrl') $(id).value = `https://${location.hostname}:4433/owd`;
   $(id).addEventListener('change', () => { try { localStorage.setItem(id, $(id).value.trim()); } catch { /* ignore */ } });
+}
+function setDefaultOwdUrl(serverDefault) {
+  try { if (localStorage.getItem('owdUrl') !== null) return; } catch { /* storage unavailable */ }
+  if (serverDefault) $('owdUrl').value = serverDefault === 'off' ? '' : serverDefault;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +147,7 @@ async function loadVideos(select) {
     logEvent('client', 'videosError', err.message);
     return;
   }
+  setDefaultOwdUrl(list.owdUrl);
   const keep = select !== undefined ? select : (pick.value || (list.simulcast ? SIMULCAST : ''));
   const options = list.videos.map((v) => {
     const o = document.createElement('option');

@@ -65,6 +65,7 @@ func main() {
 		simulcastSpec = flag.String("simulcast", "", "shared pre-encoded renditions to offer as the \"simulcast\" source: "+
 			"name=host:port@bitrate,... (MPEG-TS over UDP, e.g. high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k)")
 		simulcastAudio = flag.String("simulcast-audio", "", "rendition whose AAC audio is transcoded (once) to Opus for simulcast sessions; default the highest, \"none\" for no audio")
+		owdURL         = flag.String("owd-url", "", "owdserver WebTransport URL the downlink page measures one-way delay against by default, e.g. https://host:4433/owd (default: port 4433 on the page's host; \"off\" to disable)")
 	)
 	flag.VisitAll(func(f *flag.Flag) {
 		if v, ok := os.LookupEnv(envName(f.Name)); ok {
@@ -186,7 +187,7 @@ func main() {
 	})
 	mux.HandleFunc("GET /videos", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"videos": lib.List(r.Context()), "allowUpload": lib.AllowUpload, "maxUploadMB": *maxUploadMB,
-			"simulcast": simulcastStatus()})
+			"simulcast": simulcastStatus(), "owdUrl": *owdURL})
 	})
 	// The body is the raw file (no multipart), so large uploads stream to disk.
 	mux.HandleFunc("POST /videos", func(w http.ResponseWriter, r *http.Request) {

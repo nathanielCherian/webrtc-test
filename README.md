@@ -99,6 +99,7 @@ Every flag can also be set as an environment variable: `--foo-bar` becomes `PUFF
 | `--uplink-record` | false | save received uplink media (`.h264`/`.ivf`/`.ogg`) next to each session log |
 | `--simulcast` | | renditions for the shared simulcast source: `name=host:port@bitrate,...` (MPEG-TS over UDP), e.g. `high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k` |
 | `--simulcast-audio` | highest layer | rendition whose AAC audio is transcoded (once) to Opus; `none` for no audio |
+| `--owd-url` | `https://<page host>:4433/owd` | owdserver the downlink page measures [one-way delay](#one-way-delay-over-webtransport) against by default; `off` to disable |
 
 ## What gets measured
 
@@ -204,8 +205,9 @@ docker build -t owdserver owdserver/ && docker run --network host owdserver   # 
 | `--tls-cert` / `--tls-key` | | CA-issued certificate. Without one, a self-signed ECDSA certificate is generated and replaced every 5 days |
 | `--max-sessions` | 64 | |
 
-On the page, **Settings → One-way delay server** defaults to `https://<page host>:4433/owd`. Clear it to turn the probe
-off, or point it at an owdserver on another host. The browser remembers what you type. If the probe can't connect,
+On the page, **Settings → One-way delay server** defaults to the media server's `--owd-url`. If that isn't set, it
+defaults to `https://<page host>:4433/owd`. Clear the field to turn the probe off, or point it at an owdserver on
+another host. The browser remembers what you type, and that overrides `--owd-url`. If the probe can't connect,
 an `owdError` event explains why, and the rest of the session runs normally.
 
 **Browser requirements.** WebTransport only exists in a secure context, so the page must be served over **https** or
