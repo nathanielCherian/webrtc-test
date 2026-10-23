@@ -35,6 +35,10 @@
       <label class="wave-opt" hidden>Amplitude (kbps, &lt; center; square: high = center + amp, low = center − amp) <input id="waveAmp" type="number" value="500" min="0" step="50"></label>
       <label class="wave-opt" hidden>Period (s, ≥ 1) <input id="wavePeriod" type="number" value="10" min="1" step="1"></label>
       <label class="square-opt" hidden>Duty cycle (% of period at the high rate) <input id="waveDuty" type="number" value="50" min="1" max="99" step="5"></label>
+      <label>One-way delay server (WebTransport, owdserver; blank = off) <input id="owdUrl" type="text" placeholder="https://host:4433/owd"></label>
+      <label>One-way delay beacon interval (ms) <input id="owdInterval" type="number" value="20" min="1" max="1000" step="5"></label>
+      <label>One-way delay beacon size (bytes, 13–1100) <input id="owdSize" type="number" value="13" min="13" max="1100" step="50"></label>
+      <label>One-way delay server certificate hash (base64 SHA-256; blank = fetch from the server) <input id="owdHash" type="text"></label>
     </details>
   </div>
   <div id="status" class="status">idle</div>
@@ -53,6 +57,7 @@
     <figure><figcaption>Frame rate (fps)</figcaption><canvas id="c-fps"></canvas></figure>
     <figure><figcaption>Loss (%)</figcaption><canvas id="c-loss"></canvas></figure>
     <figure><figcaption>Delay (ms)</figcaption><canvas id="c-delay"></canvas></figure>
+    <figure><figcaption>One-way delay, WebTransport (ms)</figcaption><canvas id="c-owd"></canvas></figure>
     <figure><figcaption>Quality</figcaption><canvas id="c-quality"></canvas></figure>
   </section>
 
@@ -63,10 +68,12 @@
     <details><summary>Client: selected candidate pair / transport (raw)</summary><pre id="t-pair"></pre></details>
     <details open><summary>Server: GCC / simulcast layer / encoder / RTCP (latest)</summary><div id="t-server" class="kv"></div></details>
     <details><summary>Server: full snapshot (raw)</summary><pre id="t-server-raw"></pre></details>
+    <details open><summary>WebTransport one-way delay (latest)</summary><div id="t-owd" class="kv"></div></details>
     <details open><summary>Events</summary><ol id="events" class="events"></ol></details>
   </section>
 </main>
 <script src="common.js"></script>
+<script src="owd.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -9,3 +9,8 @@ services:
       - "50000:50000/udp"
     environment:
       PUFFER_PUBLIC_IP: "127.0.0.1"
+  owdserver:
+    network_mode: bridge
+    ports:
+      - "4433:4433/udp"
+      - "4433:4433/tcp"

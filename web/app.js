@@ -20,6 +20,7 @@ const S = {
   pendingFrames: [],    // not yet sent to server
   pendingEvents: [],
   tick: 0,
+  owd: null,            // OwdProbe (WebTransport one-way delay), if configured
 };
 
 const video = $('video');
@@ -58,6 +59,11 @@ const charts = {
   quality: new Chart($('c-quality'), [
     { key: 'height', name: 'frame height (px)' },
     { key: 'qp', name: 'avg QP' },
+  ]),
+  owd: new Chart($('c-owd'), [
+    { key: 'down', name: 'server→client (beacons)' },
+    { key: 'up', name: 'client→server (pings)' },
+    { key: 'rtt', name: 'ping RTT' },
   ]),
 };
 
@@ -103,7 +109,21 @@ $('stop').onclick = () => stop('user stop');
 $('download').onclick = download;
 
 // Settings that apply to the next session and are locked while one runs.
-const sessionInputs = ['video-pick', 'rcAlgo', 'padMode', 'waveCenter', 'waveAmp', 'wavePeriod', 'waveDuty'];
+const sessionInputs = ['video-pick', 'rcAlgo', 'padMode', 'waveCenter', 'waveAmp', 'wavePeriod', 'waveDuty', 'owdUrl', 'owdInterval', 'owdSize', 'owdHash'];
+
+// The one-way delay server defaults to the media server's --owd-url (set from
+// /videos), else owdserver on this host; whatever the viewer types is remembered.
+for (const id of ['owdUrl', 'owdInterval', 'owdSize', 'owdHash']) {
+  let saved = null;
+  try { saved = localStorage.getItem(id); } catch { /* storage unavailable */ }
+  if (saved !== null) $(id).value = saved;
+  else if (id === 'owdUrl') $(id).value = `https://${location.hostname}:4433/owd`;
+  $(id).addEventListener('change', () => { try { localStorage.setItem(id, $(id).value.trim()); } catch { /* ignore */ } });
+}
+function setDefaultOwdUrl(serverDefault) {
+  try { if (localStorage.getItem('owdUrl') !== null) return; } catch { /* storage unavailable */ }
+  if (serverDefault) $('owdUrl').value = serverDefault === 'off' ? '' : serverDefault;
+}
 
 // ---------------------------------------------------------------------------
 // Video library: pick a server-side file, or upload one.
@@ -127,6 +147,7 @@ async function loadVideos(select) {
     logEvent('client', 'videosError', err.message);
     return;
   }
+  setDefaultOwdUrl(list.owdUrl);
   const keep = select !== undefined ? select : (pick.value || (list.simulcast ? SIMULCAST : ''));
   const options = list.videos.map((v) => {
     const o = document.createElement('option');
@@ -241,7 +262,7 @@ async function start() {
   for (const id of sessionInputs) $(id).disabled = true;
   Object.assign(S, {
     statsSamples: [], frames: [], events: [], serverSnaps: [], serverHello: null, prev: null,
-    pendingFrames: [], pendingEvents: [], tick: 0, qoe: newQoE(),
+    pendingFrames: [], pendingEvents: [], tick: 0, qoe: newQoE(), owd: null,
   });
   $('events').innerHTML = '';
   for (const c of Object.values(charts)) for (const s of c.series) s.pts = [];
@@ -320,11 +341,41 @@ async function start() {
   const interval = Math.max(50, Number($('interval').value) || 250);
   S.timers.push(setInterval(pollStats, interval));
   S.timers.push(setInterval(drawCharts, 250));
+  startOwd();
+}
+
+// One-way delay probe. Independent of the PeerConnection: failing to reach the
+// owdserver is logged and the session carries on without the chart.
+async function startOwd() {
+  const url = $('owdUrl').value.trim();
+  $('t-owd').innerHTML = '';
+  if (!url) return;
+  let connected = false;
+  const probe = new OwdProbe(url, {
+    certHash: $('owdHash').value.trim() || undefined,
+    intervalMs: Number($('owdInterval').value) || undefined,
+    size: Number($('owdSize').value) || undefined,
+    onBeacon: (b) => charts.owd.push(b.t, { down: b.owdMs }),
+    onPong: (p) => charts.owd.push(p.t, { up: p.upMs, rtt: p.rttMs }),
+    onSync: (best) => logEvent('client', 'owdClockSync', `offset ${best.offsetMs.toFixed(1)} ms ± ${(best.rttMs / 2).toFixed(1)}`),
+    onClose: (why) => { if (connected && S.owd === probe) logEvent('client', 'owdClosed', why); },
+  });
+  S.owd = probe;
+  try {
+    await probe.start();
+    connected = true;
+    logEvent('client', 'owdConnected', probe.url.href);
+  } catch (err) {
+    logEvent('client', 'owdError', `${url}: ${err.message}`);
+    if (S.owd === probe) S.owd = null;
+    probe.close();
+  }
 }
 
 function stop(reason) {
   for (const t of S.timers) clearInterval(t);
   S.timers = [];
+  if (S.owd) S.owd.close(); // kept for Download JSON
   if (S.pc) {
     // Flush a final sample to the server log before closing.
     pollStats().finally(() => {
@@ -459,6 +510,7 @@ async function pollStats() {
 
   renderTables(d, vin, ain, { pair, localCand, remoteCand, transport, playout });
   renderQoE();
+  if (S.owd) $('t-owd').innerHTML = kvHTML(S.owd.summary());
 }
 
 function derive(prev, cur) {
@@ -584,6 +636,7 @@ function qoeSummary() {
     meanRttMs: rttVals.length ? rttVals.reduce((x, y) => x + y, 0) / rttVals.length : undefined,
     audioConcealedPct: a && a.cumulativeConcealedPct,
     decoder: v && v.decoderImplementation,
+    owd: S.owd ? S.owd.summary() : undefined,
   };
 }
 
@@ -597,6 +650,7 @@ function renderQoE() {
     ['Resolution', last.video.width ? `${last.video.width}×${last.video.height}` : null, ''],
     ['FPS (render)', S.qoe.renderFps, ''],
     ['RTT', last.transport.rttMs, 'ms'],
+    ['One-way delay (WT)', s.owd && s.owd.owdMeanRecentMs, 'ms'],
     ['Jitter buffer', last.video.jitterBufferMs, 'ms'],
     ['Freezes', s.freezeCount, s.totalFreezesSec !== undefined ? `${fmtNum(s.totalFreezesSec)} s` : ''],
     ['Render stalls', s.renderStalls, `${fmtNum(s.renderStallMs / 1000)} s`],
@@ -671,5 +725,6 @@ function download() {
   downloadJSON(`puffer-webrtc_${S.sessionId || 'session'}_${new Date(S.t0Wall).toISOString().replace(/[:.]/g, '-')}.json`, {
     sessionId: S.sessionId, startedAt: S.t0Wall, client: clientInfo(), qoe: qoeSummary(),
     serverHello: S.serverHello, events: S.events, stats: S.statsSamples, frames: S.frames, server: S.serverSnaps,
+    owd: S.owd ? S.owd.export() : undefined,
   });
 }

@@ -14,6 +14,7 @@ RTCP PLI/FIR ─► force IDR     server telemetry ◄── DataChannel "teleme
 - **Signaling:** a single `POST /offer` without trickle ICE. Media uses one UDP port (default 50000).
 - **Rate control:** GCC by default. The page's Settings can switch a session to an open-loop sine or square wave instead. See [Rate control](#rate-control).
 - **Shared simulcast source:** with `--simulcast`, viewers can instead receive pre-encoded renditions (for example from the [sfu-test](#shared-simulcast-source) transcoder). Each viewer keeps its own PeerConnection and rate control, but nothing is encoded per viewer: the rate control picks which rendition to forward. See [Shared simulcast source](#shared-simulcast-source).
+- **One-way delay:** the downlink page charts server→client one-way delay measured with WebTransport datagrams from `owdserver/`, a standalone service that can run on any host. See [One-way delay over WebTransport](#one-way-delay-over-webtransport).
 - **Uplink test:** `/uplink.html` reverses the direction. The browser sends a generated video and a tone, and the server receives and measures them. See [Uplink test](#uplink-test).
 
 ## Running on a server (Docker)
@@ -98,6 +99,7 @@ Every flag can also be set as an environment variable: `--foo-bar` becomes `PUFF
 | `--uplink-record` | false | save received uplink media (`.h264`/`.ivf`/`.ogg`) next to each session log |
 | `--simulcast` | | renditions for the shared simulcast source: `name=host:port@bitrate,...` (MPEG-TS over UDP), e.g. `high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k` |
 | `--simulcast-audio` | highest layer | rendition whose AAC audio is transcoded (once) to Opus; `none` for no audio |
+| `--owd-url` | `https://<page host>:4433/owd` | owdserver the downlink page measures [one-way delay](#one-way-delay-over-webtransport) against by default; `off` to disable |
 
 ## What gets measured
 
@@ -167,6 +169,62 @@ Each session writes `logs/<UTC time>_<session>.jsonl`. Every line is `{"t": <ser
 The browser sends its stats over the DataChannel. Every 4th tick it sends the full report; on the other ticks it sends only the parts that change.
 
 The **Download JSON** button saves everything the client collected, including every rendered-frame record.
+
+## One-way delay over WebTransport
+
+The downlink page's **One-way delay, WebTransport** chart comes from `owdserver/`. This is a separate, standalone
+service with its own Go module (no cgo and no media code), so it can run next to the media server or on any
+other host. Each WebTransport session receives a datagram every 20 ms (by default) carrying the server's send time.
+The page also sends a ping datagram every 250 ms. The server echoes each ping with its receive and send times, so the
+page can estimate the clock offset NTP-style over the same QUIC path. It uses the lowest-RTT ping of the last 10 s,
+so the offset error is at most RTT/2.
+
+- **server→client:** for each beacon, `receive time + offset − server send time`.
+- **client→server:** for each ping, `server receive time − (send time + offset)`.
+- **ping RTT:** RTT of each ping, not counting the server's turnaround time.
+
+The offset assumes the path is symmetric, so an asymmetric path shifts both one-way lines by a constant. Changes in
+delay, such as queueing, are measured correctly. When a new lowest-RTT ping replaces the old one, both lines can jump
+by up to the old ping's RTT/2. Each switch is logged as an `owdClockSync` event. Beacons are timestamped before they
+are queued, so any time spent waiting for QUIC congestion control counts as delay. The **WebTransport one-way delay** table shows the
+current offset, beacon loss and reordering. **Download JSON** (`owd`) includes every beacon and ping with its raw
+timestamps, so the delays can be recomputed offline.
+
+```sh
+make owdserver && ./bin/owdserver                 # UDP 4433 (WebTransport) + TCP 4433 (/cert-hash, /healthz)
+docker build -t owdserver owdserver/ && docker run --network host owdserver   # or as its own container
+```
+
+`docker compose up` starts it alongside the media server. Open **UDP and TCP 4433** in the firewall. Flags (env
+`PUFFER_OWD_<FLAG>`):
+
+| flag | default | |
+|---|---|---|
+| `--addr` | `:4433` | WebTransport on UDP; `/cert-hash` and `/healthz` on TCP |
+| `--interval` | `20ms` | default beacon interval. The page can ask for 1–1000 ms with `?interval=` and pad beacons with `?size=` (13–1100 bytes) |
+| `--tls-cert` / `--tls-key` | | CA-issued certificate. Without one, a self-signed ECDSA certificate is generated and replaced every 5 days |
+| `--max-sessions` | 64 | |
+
+On the page, **Settings → One-way delay server** defaults to the media server's `--owd-url`. If that isn't set, it
+defaults to `https://<page host>:4433/owd`. Clear the field to turn the probe off, or point it at an owdserver on
+another host. The browser remembers what you type, and that overrides `--owd-url`. If the probe can't connect,
+an `owdError` event explains why, and the rest of the session runs normally.
+
+**Browser requirements.** WebTransport only exists in a secure context, so the page must be served over **https** or
+from **localhost**. Plain `http://<server>:8080` won't show the chart. Certificates work as follows:
+- **Self-signed (default):** browsers accept it because the page pins its SHA-256 hash (`serverCertificateHashes`,
+  which only allows ECDSA certificates valid for under 14 days). The page fetches the hash from
+  `http://<host>:4433/cert-hash`. An https page usually can't fetch plain http (mixed content); in that case copy the
+  hash from that URL or from owdserver's log into **Settings → certificate hash**. The hash changes when the
+  certificate rotates and when the server restarts.
+- **CA-issued:** if the media server has a real certificate for its hostname, give owdserver the same files
+  (`--tls-cert`/`--tls-key`). No hash is needed, and the URL must use that hostname.
+- **SSH access only:** forward the page to localhost as in
+  [the SSH section](#watching-from-a-machine-that-can-only-reach-the-server-over-ssh), plus `-L 4433:localhost:4433`
+  for `/cert-hash`. Run a second `udptunnel` pair for UDP 4433, and set the URL to `https://localhost:4433/owd`. The
+  delays then include the SSH hop's TCP behaviour.
+
+Chrome/Edge and Firefox support WebTransport. Safari only supports it in recent versions.
 
 ## Choosing the video
 

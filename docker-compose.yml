@@ -21,3 +21,15 @@ services:
       - ./logs:/app/logs
       - ./videos:/app/videos
       # - ./media/your-video.mp4:/app/media/your-video.mp4:ro
+
+  # One-way delay over WebTransport for the downlink page's chart (UDP and TCP 4433).
+  # Standalone: the same image can run on any other host (see owdserver/Dockerfile).
+  owdserver:
+    build: ./owdserver
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      PUFFER_OWD_ADDR: ":4433"
+      # A CA-issued certificate for this host instead of the rotating self-signed one:
+      # PUFFER_OWD_TLS_CERT: "/certs/fullchain.pem"
+      # PUFFER_OWD_TLS_KEY: "/certs/privkey.pem"
